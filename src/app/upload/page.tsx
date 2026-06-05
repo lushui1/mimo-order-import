@@ -86,6 +86,14 @@ export default function UploadPage() {
 
     try {
       const fileText = rawFileToText(rawFile, 40);
+      console.log("[DEBUG] rawFileToText output (first 2000 chars):", fileText.substring(0, 2000));
+      console.log("[DEBUG] rawFile sheets:", rawFile.sheets.length, "first sheet rows:", rawFile.sheets[0]?.rows.length, "maxCol:", rawFile.sheets[0]?.maxCol);
+      // Print first 5 rows for debugging
+      if (rawFile.sheets[0]) {
+        for (let i = 0; i < Math.min(10, rawFile.sheets[0].rows.length); i++) {
+          console.log(`[DEBUG] Row ${i}:`, JSON.stringify(rawFile.sheets[0].rows[i]));
+        }
+      }
       setProgress({ current: 40, total: 100, text: "本地启发式分析中..." });
 
       const response = await fetch("/api/ai/analyze", {

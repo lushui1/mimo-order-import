@@ -195,8 +195,39 @@ function parseSheet(rule: ParseRule, sheet: RawSheet, _sheetName: string): Parse
   // ==== 多层次表头检测：扫描规则指定的行 ±3 → 自动检测行 ±3 → 全表头候选行 ====
   let matchedCols = 0;
 
-  // Level 1: 规则指定的 headerRow ±3 范围内扫描
-  if (columnMappings.length > 0) {
+  // Level 0: 检查是否有推断列映射（sourceField = "colN" 格式，直接用列索引）
+  const inferredMappings = columnMappings.filter((m: any) => m.sourceField && /^col\d+$/i.test(m.sourceField));
+  if (inferredMappings.length > 0) {
+    console.log(`[parseSheet] Level 0: Using inferred column mappings (${inferredMappings.length})`);
+    for (const mapping of inferredMappings) {
+      const colIdx = parseInt((mapping as any).sourceField.replace(/^col/i, ""), 10);
+      if (colIdx >= 0 && !fieldMap.has(mapping.targetField)) {
+        fieldMap.set(mapping.targetField, { colIndex: colIdx, mapping });
+        matchedCols++;
+      }
+    }
+    // 推断映射时，找元数据区域和数据区域的分界线
+    // 从行0往下找，找到第一个有推断列数个非空单元格的行 → 数据起始行
+    if (matchedCols > 0) {
+      for (let r = 0; r < sheet.rows.length; r++) {
+        const row = sheet.rows[r];
+        if (!row) continue;
+        // 检查是否是数据行：推断的列索引位置都有值
+        const nonEmptyInferred = inferredMappings.filter((m: any) => {
+          const ci = parseInt(m.sourceField.replace(/^col/i, ""), 10);
+          return ci < row.length && row[ci] !== null && String(row[ci]).trim() !== "";
+        }).length;
+        if (nonEmptyInferred >= Math.min(inferredMappings.length, 2)) {
+          headerRow = Math.max(0, r - 1);
+          break;
+        }
+      }
+      console.log(`[parseSheet] Level 0: inferred ${matchedCols} cols, headerRow=${headerRow}`);
+    }
+  }
+
+  // Level 1: 规则指定的 headerRow ±3 范围内扫描（仅当 Level 0 未匹配时）
+  if (matchedCols === 0 && columnMappings.length > 0) {
     const scanResult = scanHeaderRows(sheet, headerRow, columnMappings, 3);
     fieldMap = scanResult.fieldMap;
     matchedCols = scanResult.matched;
@@ -285,7 +316,26 @@ function parseSheet(rule: ParseRule, sheet: RawSheet, _sheetName: string): Parse
 
     // Apply column mappings
     for (const [targetField, { colIndex, mapping }] of fieldMap) {
-      if (colIndex < 0 || colIndex >= row.length) {
+      let effectiveColIdx = colIndex;
+      // 推断映射容错：如果行的列数比预期少1（名称+规格合并的情况），
+      // 且当前映射指向最后一个列但行长度不够，尝试从行的最后一个非空列读取
+      if (colIndex >= row.length && inferredMappings.length > 0 && row.length > 0) {
+        // 找到行中最后一个非空列
+        let lastNonEmptyIdx = -1;
+        for (let ci = row.length - 1; ci >= 0; ci--) {
+          if (row[ci] !== null && String(row[ci]).trim() !== "") {
+            lastNonEmptyIdx = ci;
+            break;
+          }
+        }
+        if (lastNonEmptyIdx >= 0 && lastNonEmptyIdx < colIndex) {
+          // 只对 SKU发货数量 做这个容错（数量通常在最后一列）
+          if (targetField === "SKU发货数量" && colIndex === Math.max(...[...fieldMap.values()].map(f => f.colIndex))) {
+            effectiveColIdx = lastNonEmptyIdx;
+          }
+        }
+      }
+      if (effectiveColIdx < 0 || effectiveColIdx >= row.length) {
         if (mapping.defaultValue) {
           (order as any)[targetField] = mapping.defaultValue;
         }

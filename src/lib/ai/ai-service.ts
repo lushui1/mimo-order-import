@@ -337,7 +337,12 @@ function localAnalyze(
     rule.header = { skipRows: actualHeaderRow, headerRow: actualHeaderRow };
 
     // 用和 Excel 相同的映射逻辑
-    if (headerColumns.length > 0 && bestScore > 0) {
+    // 阈值: bestScore <= 2 时可能只是碰巧匹配1-2个关键词（如"序号"或"名称"），不够可靠
+    // 如果映射结果为0则fallback到推断逻辑
+    const MIN_HEADER_SCORE = 3; // 至少匹配3个表头关键词才认为找到了真正的表头行
+    const shouldUseHeaderMapping = headerColumns.length > 0 && bestScore >= MIN_HEADER_SCORE;
+
+    if (shouldUseHeaderMapping) {
       const mappings: any[] = [];
       const mappedTargets = new Set<string>();
 
@@ -346,7 +351,7 @@ function localAnalyze(
         let mapping: any = null;
 
         if (!mappedTargets.has("SKU物品编码") &&
-            (cl.includes("物品编码") || cl.includes("sku编码") || cl.includes("产品编码") || cl === "编码" || cl.includes("序号") ||
+            (cl.includes("物品编码") || cl.includes("sku编码") || cl.includes("产品编码") || cl === "编码" ||
              cl === "code" || cl.includes("itemcode") || cl.includes("item_code") || cl.includes("productcode"))) {
           mapping = { sourceField: col, targetField: "SKU物品编码", isRequired: true, aiConfidence: 0.9 };
         } else if (!mappedTargets.has("SKU物品名称") &&
@@ -387,16 +392,212 @@ function localAnalyze(
       }
 
       rule.columnMappings = mappings;
-      console.log(`[localAnalyze-PDF] Generated ${mappings.length} mappings:`, mappings.map(m => `${m.sourceField}→${m.targetField}`));
-    } else {
-      // 没找到表头，用空 sourceField + 同义词匹配兜底
-      console.warn("[localAnalyze-PDF] No header found, using empty sourceField with synonym fallback");
-      rule.columnMappings = [
-        { sourceField: "", targetField: "SKU物品编码", aiConfidence: 0.7 },
-        { sourceField: "", targetField: "SKU物品名称", aiConfidence: 0.7 },
-        { sourceField: "", targetField: "SKU发货数量", isRequired: true, transform: "toNumber", aiConfidence: 0.7 },
-        { sourceField: "规格型号", targetField: "SKU规格型号", aiConfidence: 0.6 },
-      ];
+      console.log(`[localAnalyze-PDF] Header-based: Generated ${mappings.length} mappings (bestScore=${bestScore}):`, mappings.map(m => `${m.sourceField}→${m.targetField}`));
+
+      // 如果映射不足2个，fallback到推断逻辑
+      if (mappings.length < 2) {
+        console.warn(`[localAnalyze-PDF] Header mapping insufficient (${mappings.length} < 2), falling back to data pattern inference`);
+        rule.columnMappings = []; // 清空，走推断逻辑
+      }
+    }
+
+    // 推断逻辑：当没有可靠表头行，或表头映射不足时
+    if (!shouldUseHeaderMapping || (rule.columnMappings?.length ?? 0) < 2) {
+      // 没找到表头 → 通过扫描数据行的值特征推断列的含义
+      console.warn("[localAnalyze-PDF] No header found, inferring columns from data patterns");
+
+      // 收集所有数据行（跳过元数据行、空行、表头行）
+      const headerWords = ["编码", "名称", "数量", "规格", "序号", "类别", "单位", "code", "name", "qty", "spec"];
+      const dataLines: string[][] = [];
+      for (let i = 0; i < Math.min(lines.length, 50); i++) {
+        const line = lines[i].replace(/^行\d+:\s*/, "");
+        const cols = line.includes("|")
+          ? line.split(/\s*\|\s*/).map((c) => c.trim()).filter((c) => c.length > 0)
+          : line.split(/\s{2,}/).map((c) => c.trim()).filter((c) => c.length > 0);
+        // 只取多列行（>=3列的才是数据行），排除元数据行（含冒号的标签行）
+        if (cols.length >= 3) {
+          const colonCount = cols.filter(c => /^[^\d]{2,8}[：:]/.test(c)).length;
+          if (colonCount >= cols.length / 2) continue; // 元数据行
+          // 排除表头行：如果一行的列值中有多列匹配表头关键词，跳过
+          const headerMatchCount = cols.filter(c => {
+            const cl = c.toLowerCase().replace(/\s/g, "");
+            return headerWords.some(hw => cl === hw || cl.includes(hw));
+          }).length;
+          if (headerMatchCount >= 2) continue; // 至少2列匹配表头关键词 → 表头行
+          dataLines.push(cols);
+        }
+      }
+
+      // 找出现次数最多的列数（最可能的表格列结构）
+      const colCountFreq: Record<number, number> = {};
+      for (const dl of dataLines) {
+        colCountFreq[dl.length] = (colCountFreq[dl.length] || 0) + 1;
+      }
+      const dominantColCount = Object.entries(colCountFreq)
+        .sort((a, b) => b[1] - a[1])[0]?.[0];
+      const targetColCount = dominantColCount ? parseInt(dominantColCount, 10) : 0;
+
+      if (targetColCount >= 3) {
+        // 按列位置收集所有值，分析每列的特征
+        // 允许列数在 targetColCount ±1 范围内的行参与分析（处理名称+规格合并的情况）
+        const colValues: string[][] = Array.from({ length: targetColCount }, () => []);
+        for (const dl of dataLines) {
+          if (dl.length === targetColCount) {
+            for (let ci = 0; ci < targetColCount; ci++) {
+              colValues[ci].push(dl[ci]);
+            }
+          } else if (dl.length === targetColCount - 1) {
+            // 少一列的情况（如名称+规格合并）：前面的列正常映射，最后一个空列补空
+            for (let ci = 0; ci < dl.length; ci++) {
+              colValues[ci].push(dl[ci]);
+            }
+            // 最后一列（通常是规格或名称被合并了）补空字符串
+            colValues[targetColCount - 1].push("");
+          }
+        }
+
+        // 分析每列的特征
+        const inferredMappings: any[] = [];
+        const mappedTargets = new Set<string>();
+        const columnScores: { ci: number; type: string; score: number; avgLen: number }[] = [];
+
+        for (let ci = 0; ci < targetColCount; ci++) {
+          const vals = colValues[ci];
+          if (vals.length === 0) continue;
+
+          // 排除空值
+          const nonEmptyVals = vals.filter(v => v.trim() !== "");
+
+          // 检测物品编码格式 (如 ZBWP0001, A001 等)，排除空值
+          const codePattern = /^[A-Z]{2,5}\d{3,}$/;
+          const codeRatio = nonEmptyVals.length > 0
+            ? nonEmptyVals.filter(v => codePattern.test(v.trim())).length / nonEmptyVals.length
+            : 0;
+
+          // 检测纯数字（可能是序号或数量），排除空值
+          const numRatio = nonEmptyVals.length > 0
+            ? nonEmptyVals.filter(v => /^\d+(\.\d+)?$/.test(v.trim())).length / nonEmptyVals.length
+            : 0;
+
+          // 检测序号特征（1,2,3...递增，允许有1-2个缺失/跳号）
+          const isSequential = (() => {
+            if (nonEmptyVals.length < 3) return false;
+            const numOnlyVals = nonEmptyVals.filter(v => /^\d+$/.test(v.trim()));
+            if (numOnlyVals.length < 3) return false;
+            const sample = numOnlyVals.slice(0, Math.min(numOnlyVals.length, 15));
+            const nums = sample.map(v => parseInt(v.trim(), 10));
+            if (nums.some(n => isNaN(n))) return false;
+            // 允许最多1个跳号（差值为2而非1），整体应该是递增的
+            let skips = 0;
+            for (let k = 1; k < nums.length; k++) {
+              const diff = nums[k] - nums[k - 1];
+              if (diff === 1) continue;
+              if (diff === 2) { skips++; continue; } // 允许1次跳号
+              return false; // 差值>2 或非递增
+            }
+            return skips <= 1;
+          })();
+
+          // 检测单位（件/瓶/包/桶/盒等），排除空值
+          const unitKeywords = ["件", "瓶", "包", "桶", "盒", "袋", "箱", "个", "套"];
+          const unitRatio = nonEmptyVals.length > 0
+            ? nonEmptyVals.filter(v => unitKeywords.some(u => v.trim() === u)).length / nonEmptyVals.length
+            : 0;
+
+          // 检测类别（饮品类/熟烙类/主食类等），排除空值
+          const categoryPattern = /.{2,4}类$/;
+          const categoryRatio = nonEmptyVals.length > 0
+            ? nonEmptyVals.filter(v => categoryPattern.test(v.trim())).length / nonEmptyVals.length
+            : 0;
+
+          // 检测规格（含数字+单位模式如 750ml*6, 2.5kg*4 等），排除空值
+          const specRatio = nonEmptyVals.length > 0
+            ? nonEmptyVals.filter(v => /\d+(\.\d+)?\s*(ml|kg|g|L)\s*[*×x]/i.test(v.trim())).length / nonEmptyVals.length
+            : 0;
+
+          // 平均长度（排除空值）
+          const avgLen = nonEmptyVals.length > 0
+            ? nonEmptyVals.reduce((sum, v) => sum + v.length, 0) / nonEmptyVals.length
+            : 0;
+
+          // 检测物品名称（长文本，不含规格模式，含中文为主），排除空值
+          const nameLikeRatio = nonEmptyVals.length > 0
+            ? nonEmptyVals.filter(v => v.length >= 4 && /[\u4e00-\u9fff]/.test(v)).length / nonEmptyVals.length
+            : 0;
+
+          // 分类推断
+          console.log(`[localAnalyze-PDF] col${ci}: codeRatio=${codeRatio.toFixed(2)}, isSequential=${isSequential}, unitRatio=${unitRatio.toFixed(2)}, categoryRatio=${categoryRatio.toFixed(2)}, numRatio=${numRatio.toFixed(2)}, specRatio=${specRatio.toFixed(2)}, nameLikeRatio=${nameLikeRatio.toFixed(2)}, avgLen=${avgLen.toFixed(1)}, sample=${vals.slice(0, 3).join("|")}`);
+          if (codeRatio > 0.3) {
+            columnScores.push({ ci, type: "SKU物品编码", score: codeRatio, avgLen });
+          } else if (isSequential) {
+            columnScores.push({ ci, type: "_序号", score: 1, avgLen });
+          } else if (unitRatio > 0.3) {
+            columnScores.push({ ci, type: "_单位", score: unitRatio, avgLen });
+          } else if (categoryRatio > 0.3) {
+            columnScores.push({ ci, type: "_类别", score: categoryRatio, avgLen });
+          } else if (numRatio > 0.5 && avgLen <= 5 && !isSequential) {
+            // 纯数字且不是序号 → 数量列
+            columnScores.push({ ci, type: "SKU发货数量", score: numRatio, avgLen });
+          } else if (specRatio > 0.2) {
+            // 含规格模式（如 750ml*6, 1L*12瓶/件） → 规格列
+            // 注意：规格文本可能含中文（nameLikeRatio高），但specRatio是最强信号
+            columnScores.push({ ci, type: "SKU规格型号", score: specRatio, avgLen });
+          } else if (nameLikeRatio > 0.5 && avgLen > 3) {
+            // 长文本+含中文 → 名称
+            columnScores.push({ ci, type: "SKU物品名称", score: nameLikeRatio, avgLen });
+          } else if (numRatio > 0.3 && avgLen <= 5) {
+            // 兜底：短数字列 → 数量
+            columnScores.push({ ci, type: "SKU发货数量", score: numRatio * 0.8, avgLen });
+          }
+        }
+
+        // 生成映射（跳过 _序号、_单位、_类别）
+        for (const cs of columnScores) {
+          if (cs.type.startsWith("_")) continue; // 跳过不映射的列
+          if (mappedTargets.has(cs.type)) continue;
+          const isRequired = cs.type === "SKU物品编码" || cs.type === "SKU物品名称" || cs.type === "SKU发货数量";
+          const transform = cs.type === "SKU发货数量" ? "toNumber" : undefined;
+          inferredMappings.push({
+            sourceField: `col${cs.ci}`,
+            targetField: cs.type,
+            isRequired,
+            transform,
+            aiConfidence: Math.min(cs.score, 0.9),
+            _inferred: true,
+          });
+          mappedTargets.add(cs.type);
+        }
+
+        if (inferredMappings.length >= 2) {
+          rule.columnMappings = inferredMappings;
+          // 找到第一个数据行的行号作为 headerRow
+          const firstDataLineIdx = lines.findIndex(l => {
+            const clean = l.replace(/^行\d+:\s*/, "");
+            const cols = clean.includes("|")
+              ? clean.split(/\s*\|\s*/).map((c) => c.trim()).filter((c) => c.length > 0)
+              : clean.split(/\s{2,}/).map((c) => c.trim()).filter((c) => c.length > 0);
+            return cols.length === targetColCount;
+          });
+          const headerRowMatch = firstDataLineIdx >= 0 ? lines[firstDataLineIdx].match(/^行(\d+):/) : null;
+          const inferredHeaderRow = headerRowMatch ? parseInt(headerRowMatch[1], 10) : 0;
+          rule.header = { skipRows: inferredHeaderRow, headerRow: inferredHeaderRow };
+          console.log(`[localAnalyze-PDF] Inferred ${inferredMappings.length} mappings from data patterns, headerRow=${inferredHeaderRow}`);
+        } else {
+          // 数据推断不够，回退到空 sourceField 同义词匹配
+          rule.columnMappings = [
+            { sourceField: "", targetField: "SKU物品编码", aiConfidence: 0.7 },
+            { sourceField: "", targetField: "SKU物品名称", aiConfidence: 0.7 },
+            { sourceField: "", targetField: "SKU发货数量", isRequired: true, transform: "toNumber", aiConfidence: 0.7 },
+          ];
+        }
+      } else {
+        // 列数不够，回退到空 sourceField 同义词匹配
+        rule.columnMappings = [
+          { sourceField: "", targetField: "SKU物品编码", aiConfidence: 0.7 },
+          { sourceField: "", targetField: "SKU物品名称", aiConfidence: 0.7 },
+          { sourceField: "", targetField: "SKU发货数量", isRequired: true, transform: "toNumber", aiConfidence: 0.7 },
+        ];
+      }
     }
 
     // 检测是否需要多订单切分（PDF 中包含多个独立签收单）
