@@ -128,22 +128,30 @@ function findColumnIndex(sheet: RawSheet, headerRow: number, fieldName: string, 
   }
 
   // Step 3: Reverse fuzzy (header contains fieldName keyword)
+  // 增加长度限制：列头通常较短（<=30字符），避免把包含关键词的长文本值误判为列头
   if (normalizedField.length >= 2) {
     for (let c = 0; c < row.length; c++) {
       const val = row[c];
-      const cell = val !== null ? normalizeStr(String(val)) : "";
+      if (val === null) continue;
+      const strVal = String(val).trim();
+      if (strVal.length > 30) continue; // 跳过太长的单元格（不是列头）
+      const cell = normalizeStr(strVal);
       if (cell && (cell.includes(normalizedField) || normalizedField.includes(cell))) return c;
     }
   }
 
   // Step 4: Synonym match (using targetField to lookup synonyms)
+  // 同样增加长度限制，避免误判
   if (targetField) {
     const synonyms = FIELD_SYNONYMS[targetField] || [];
     for (const syn of synonyms) {
       const normalizedSyn = normalizeStr(syn);
       for (let c = 0; c < row.length; c++) {
         const val2 = row[c];
-        const cell2 = val2 !== null ? normalizeStr(String(val2)) : "";
+        if (val2 === null) continue;
+        const strVal2 = String(val2).trim();
+        if (strVal2.length > 30) continue;
+        const cell2 = normalizeStr(strVal2);
         if (cell2 && (cell2.includes(normalizedSyn) || normalizedSyn.includes(cell2))) {
           console.log(`[findColumnIndex] Synonym match: "${syn}" → column ${c} ("${row[c]}")`);
           return c;

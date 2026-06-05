@@ -7,7 +7,7 @@ import type { ParseRule } from "../types";
 // 服务端环境变量（不带 NEXT_PUBLIC_ 前缀）
 const API_BASE = process.env.AI_API_BASE_URL || process.env.AI_API_URL || process.env.NEXT_PUBLIC_AI_API_URL || "https://api.deepseek.com/v1";
 const API_KEY = process.env.AI_API_KEY || process.env.NEXT_PUBLIC_AI_API_KEY || "";
-const AI_MODEL = process.env.AI_MODEL || "mimo-v2.5-pro";
+const AI_MODEL = process.env.AI_MODEL || "mimo-v2.5";
 
 export async function analyzeFileAndGenerateRule(
   fileContent: string,
@@ -26,15 +26,15 @@ export async function analyzeFileAndGenerateRule(
   try {
     const prompt = buildAnalysisPrompt(fileContent, fileName, fileType);
 
-    console.log(`[AI] Calling ${AI_MODEL} at ${API_BASE}...`);
+    console.log(`[AI] Calling ${AI_MODEL} at ${API_BASE} (streaming mode)...`);
     const startTime = Date.now();
 
-    // Vercel hobby plan 限制 serverless function 10s 超时
-    // 设置 9s 超时，给 AI 更多响应时间，同时确保在 Vercel 杀掉函数前能返回兜底结果
-    const AI_TIMEOUT_MS = 9000;
+    // Vercel hobby plan maxDuration=60s, 设 55s 超时，留 5s 给返回处理
+    const AI_TIMEOUT_MS = 55000;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
+    // 使用流式调用，先拿到第一个 token 就知道 API 可达
     const response = await fetch(`${API_BASE}/chat/completions`, {
       method: "POST",
       headers: {
@@ -49,23 +49,65 @@ export async function analyzeFileAndGenerateRule(
         ],
         temperature: 0.05,
         max_tokens: 8000,
+        stream: true,
       }),
       signal: controller.signal,
     });
 
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      throw new Error(`API Error: ${response.status} ${errText.substring(0, 200)}`);
+    }
+
+    // 流式读取，拼接完整响应
+    let fullContent = "";
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("No response body reader");
+
+    const decoder = new TextDecoder();
+    let chunkCount = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, { stream: true });
+      chunkCount++;
+
+      // 解析 SSE 格式：data: {...}\n\n
+      const lines = chunk.split("\n");
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data:")) continue;
+        const data = trimmed.slice(5).trim();
+        if (data === "[DONE]") continue;
+
+        try {
+          const parsed = JSON.parse(data);
+          const delta = parsed.choices?.[0]?.delta?.content || "";
+          if (delta) {
+            fullContent += delta;
+          }
+        } catch {
+          // 忽略不完整的 JSON chunk
+        }
+      }
+
+      // 首次收到数据时记录
+      if (chunkCount === 1) {
+        const elapsed = Date.now() - startTime;
+        console.log(`[AI] First chunk received in ${elapsed}ms`);
+      }
+    }
+
     clearTimeout(timeoutId);
 
     const elapsed = Date.now() - startTime;
-    console.log(`[AI] Response in ${elapsed}ms, status=${response.status}`);
-
-    if (!response.ok) throw new Error(`API Error: ${response.status}`);
-
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content || "";
-    console.log(`[AI] Raw response content length=${content.length}, preview="${content.substring(0, 200).replace(/\n/g, "\\n")}"`);
+    console.log(`[AI] Streaming completed in ${elapsed}ms, content length=${fullContent.length}`);
+    console.log(`[AI] Raw response preview: "${fullContent.substring(0, 300).replace(/\n/g, "\\n")}"`);
 
     // Extract JSON from response (handle markdown code blocks and extra text)
-    const aiResult = extractJsonFromAiResponse(content);
+    const aiResult = extractJsonFromAiResponse(fullContent);
     if (aiResult && isValidAiRule(aiResult)) {
       console.log(`[AI] Valid rule from AI: ${aiResult.columnMappings?.length || 0} mappings, headerRow=${aiResult.header?.headerRow}`);
       // Merge AI结果与localResult：AI缺少的必填字段用localResult补充

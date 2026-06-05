@@ -91,7 +91,12 @@ async function parseWord(buffer: ArrayBuffer): Promise<RawSheet[]> {
 async function parsePdf(buffer: ArrayBuffer): Promise<RawSheet[]> {
   // 使用 pdfjs-dist（支持浏览器端）
   const pdfjsLib = await import("pdfjs-dist");
-  pdfjsLib.GlobalWorkerOptions.workerSrc = "";
+
+  // 设置 Worker：使用 CDN 版本对应的 pdf.worker.mjs
+  // pdfjs-dist 4.x 在浏览器端需要配置 worker，否则抛出 "No GlobalWorkerOptions.workerSrc" 错误
+  // 方案1：使用 CDN 上对应版本的 worker
+  const pdfjsVersion = pdfjsLib.version || "4.10.38";
+  pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsVersion}/pdf.worker.min.mjs`;
 
   const pdf = await pdfjsLib.getDocument({ data: buffer.slice(0) }).promise;
   const pages: { text: string; rows: (string | null)[][] }[] = [];

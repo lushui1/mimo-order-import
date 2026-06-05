@@ -3,6 +3,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { analyzeFileAndGenerateRule } from "@/lib/ai/ai-service";
 
+// Vercel hobby plan 默认 10s，设为 60s 给 AI reasoning 模型足够时间
+export const maxDuration = 60;
+
 export async function POST(req: NextRequest) {
   const startTime = Date.now();
   try {

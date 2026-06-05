@@ -1,45 +1,36 @@
-# 万能导入 V2 — Bug 修复总结
+# 第七轮修复 — 按外部编码聚合出库单 + AI 修复 + 预览页重构
 
-## 修复日期
-2026-06-05
+## 完成内容
 
-## 修复内容
+### 1. AI 模型测试 ✅
+- curl 直接测试 mimo-v2.5-pro（TokenPlan/小米）→ 正常返回
+- 模型无问题，baseUrl `https://token-plan-cn.xiaomimimo.com/v1` 可用
 
-### Bug 1: AI 生成规则解析总是返回空结果 🔴 Critical
+### 2. AI max_tokens 修复
+- `max_tokens: 2500` → `8000`
+- mimo-v2.5-pro 是 reasoning 模型，会先输出 `reasoning_content` 再输出正式内容，2500 tokens 不够用
 
-**根因**: `ai-service.ts` 中的 `localAnalyze()` 函数使用文本行索引(`headerRowIdx`)作为 Excel 实际行号，导致 `headerRow` 偏移错误。例如文件有 3 行前置信息（文件名/类型/Sheet标记），真实的表头在第 1 行，但 `headerRow` 被设为 4（文本数组索引），导致 `parseSheet` 在错误的行读取列头，全部列匹配失败 → 零结果。
+### 3. groupByField 关键 Bug 修复
+- **根因**: `aggregation.groupByField` 存的是 sourceField（如"配送单号"），但 `parseSheet()` 输出的 ParsedOrder 用的是 targetField（如"外部编码"）→ `applyAggregation` 用 `(order as any)[groupField]` 永远是 undefined → 聚合失效
+- **修复**: 始终按 targetField `"外部编码"` 分组，不再依赖 sourceField
 
-**修复**:
-- `ai-service.ts`: `localAnalyze()` 现在从 "行N:" 前缀解析出实际行号，不再使用文本数组索引
-- `rule-executor.ts`: 新增 `findColumnByTargetField()` 兜底函数——当 AI 返回的 `sourceField` 匹配不到时，直接用 `targetField` 的同义词搜索列头
-- `rule-executor.ts`: `findColumnIndex()` 新增规范化匹配步骤（Step 1.5），处理 `"物品编码*"` vs `"物品编码"` 这类特殊字符差异
-- `rule-executor.ts`: `buildFieldMap()` 增加三级兜底：sourceField匹配 → targetField同义词 → 数字列索引
+### 4. applyAggregation 彻底重写
+- **按外部编码分组**: 同一外部编码下的 SKU 行共享收货信息，展示为一个出库单
+- **SKU 去重合并**: 相同 SKU物品编码 → 数量求和，补充缺失名称/规格
+- **收货信息共享**: 取组内第一个非空值，强制统一到整组
+- **O(n) Map 复杂度**: 性能优化
+- **分组标记**: `_groupKey` / `_groupSize` / `_groupIndex` 供 UI 使用
 
-### Bug 2: 汇总行被错误解析为数据行 🟡 Medium
+### 5. 预览页重构（出库单分组卡片展示）
+- 每个出库单 = 一个可折叠卡片
+  - 头部：外部编码 + 收货信息摘要 + SKU数量 badge
+  - 收货信息栏：可编辑，修改同步到整组
+  - SKU 明细表：编号、操作、SKU编码/名称/数量/规格/备注
+- 重复标记：历史重复(红) / 同批次重复(黄)
+- 分页：每页 20 个出库单分组
+- 统计：共 N 个出库单 · M 条 SKU 记录
 
-**问题**: 调拨单格式中的汇总行（如 "合计：3 个门店 | 9 种物品 | 总调拨数量：44 件/包"）只检查了第0列，漏检了分散在其他列的汇总信息。
-
-**修复**:
-- `rule-executor.ts`: 新增 `isSummaryRow()` 函数，扫描整行所有单元格
-- 关键词覆盖：合计/总计/共计/小计/累计/汇总/总调拨数量/总数量/总金额
-- 正则模式：`\d+ 个 (门店|仓库|站点|店铺)`、`\d+ 种 (物品|商品|SKU)`、`总(调拨|发货|出库|入库)数量[：:]`
-- 同步修复 `applyCardBoundary()` 和 `splitPdfOrders()` 中的汇总行检测
-
-### Bug 3: 考试要求合规性检查 ✅ Pass
-
-- 无文件名判断（grep fileName.includes/match/indexOf 返回空）
-- 无硬编码列名在解析逻辑中（列映射全部通过规则配置，而非条件判断）
-- 预置规则(presets.ts)中的列名属于规则配置范畴，符合"通过配置规则实现兼容"的要求
-
-## 涉及文件
-
-| 文件 | 修改内容 |
-|------|---------|
-| `src/lib/rule-engine/rule-executor.ts` | 新增 `findColumnByTargetField()`、`isSummaryRow()`，增强 `buildFieldMap()` 和 `findColumnIndex()` |
-| `src/lib/ai/ai-service.ts` | 修复 `localAnalyze()` 的 `headerRow` 行号提取（从文本行索引改为实际 Excel 行号） |
-
-## 构建状态
-✅ `next build` 编译成功，无 TypeScript 错误
-
-## 部署
-⚠️ Vercel token 过期，需运行 `vercel login` 重新认证后部署
+### 6. 部署
+- git push → Vercel 自动部署
+- 清理了 git history 中的 Vercel token secret
+- 生产地址: https://20260605135655.vercel.app
