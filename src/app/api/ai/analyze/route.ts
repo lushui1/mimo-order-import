@@ -22,7 +22,7 @@ export async function POST(req: NextRequest) {
     }
 
     // 限制文件内容长度，防止超时
-    const truncatedContent = fileContent.substring(0, 5000);
+    const truncatedContent = fileContent.substring(0, 3000);
     console.log(`[API /ai/analyze] Truncated to ${truncatedContent.length} chars, calling analyze...`);
 
     const rule = await analyzeFileAndGenerateRule(truncatedContent, fileName, fileType);

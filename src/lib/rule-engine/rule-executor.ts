@@ -448,23 +448,57 @@ function applyFooterExtraction(rule: ParseRule, sheet: RawSheet, orders: ParsedO
   if (!rule.footerExtraction?.enabled || !rule.footerExtraction.sections.length) return;
 
   for (const section of rule.footerExtraction.sections) {
-    // Find the start row
+    // Find the start row: 扫描整行所有单元格，不只是 col 0
     let startRow = -1;
     for (let r = 0; r < sheet.rows.length; r++) {
       const row = sheet.rows[r];
-      if (row && row[0] !== null && String(row[0]).includes(section.startKeyword)) {
-        startRow = r;
-        break;
+      if (!row) continue;
+      for (let c = 0; c < row.length; c++) {
+        const val = row[c];
+        if (val !== null && String(val).includes(section.startKeyword)) {
+          startRow = r;
+          break;
+        }
       }
+      if (startRow >= 0) break;
     }
     if (startRow < 0) continue;
 
-    const row = sheet.rows[startRow];
+    // 从 startRow 开始向下搜索每个字段
     for (const field of section.fields) {
-      const val = row[field.offset] ?? "";
-      if (val !== null && val !== "") {
+      let fieldVal = "";
+      // 在 startRow 及后续 5 行内搜索关键词
+      for (let r = startRow; r < Math.min(startRow + 6, sheet.rows.length); r++) {
+        const row = sheet.rows[r];
+        if (!row) continue;
+        for (let c = 0; c < row.length; c++) {
+          const val = row[c];
+          if (val !== null && String(val).includes(field.keyword)) {
+            // 尝试提取关键词后的值
+            const strVal = String(val).trim();
+            // 模式1："关键词：值" 或 "关键词:值"
+            const kvMatch = strVal.match(new RegExp(field.keyword + "[：:]\\s*(.+)"));
+            if (kvMatch && kvMatch[1].trim()) {
+              fieldVal = kvMatch[1].trim();
+              break;
+            }
+            // 模式2：关键词在当前单元格，值在 offset 列
+            const offsetCol = c + field.offset;
+            if (offsetCol >= 0 && offsetCol < row.length && row[offsetCol] !== null) {
+              const offsetVal = String(row[offsetCol]).trim();
+              if (offsetVal && offsetVal !== field.keyword) {
+                fieldVal = offsetVal;
+                break;
+              }
+            }
+          }
+        }
+        if (fieldVal) break;
+      }
+
+      if (fieldVal) {
         for (const order of orders) {
-          (order as any)[field.targetField] = String(val).trim();
+          (order as any)[field.targetField] = fieldVal;
         }
       }
     }

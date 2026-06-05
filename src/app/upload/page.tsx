@@ -82,11 +82,12 @@ export default function UploadPage() {
   const handleAiAnalyze = async () => {
     if (!rawFile || !file) return;
     setStep("ai-analyze");
-    setProgress({ current: 10, total: 100, text: "AI 正在分析文件结构..." });
+    setProgress({ current: 20, total: 100, text: "正在智能分析文件结构..." });
 
     try {
-      const fileText = rawFileToText(rawFile, 40); // 减少到40行加速AI分析
-      // 通过服务端 API 调用 AI，避免暴露 API Key
+      const fileText = rawFileToText(rawFile, 40);
+      setProgress({ current: 40, total: 100, text: "本地启发式分析中..." });
+
       const response = await fetch("/api/ai/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -103,24 +104,28 @@ export default function UploadPage() {
       const data = await response.json();
       const rule = data.rule;
 
-      // 安全检查：如果规则没有列映射，说明分析失败
       if (!rule.columnMappings || rule.columnMappings.length === 0) {
-        throw new Error("AI 未生成有效的列映射，请尝试手动创建规则");
+        throw new Error("未生成有效的列映射，请尝试手动创建规则");
       }
 
       setAiRule(rule);
       setShowAiResult(true);
 
-      // 如果是 fallback 规则，提示用户
-      if ((rule as any)._fallback) {
-        setProgress({ current: 100, total: 100, text: "本地分析完成（AI 未返回有效规则）" });
-        toast.showToast(`AI 分析未返回有效规则，已使用本地启发式分析替代`, "info");
+      // 根据来源显示不同提示
+      const isFallback = (rule as any)._fallback;
+      const hasSourceField = rule.columnMappings?.filter((m: any) => m.sourceField && m.sourceField.trim()).length || 0;
+      if (isFallback) {
+        setProgress({ current: 100, total: 100, text: "分析完成（本地启发式，建议核对列映射）" });
+        toast.showToast(`AI 未返回有效规则，已使用本地分析替代`, "info");
+      } else if (hasSourceField >= 3) {
+        setProgress({ current: 100, total: 100, text: "智能分析完成" });
+        toast.showToast("智能分析完成，请确认规则", "success");
       } else {
-        setProgress({ current: 100, total: 100, text: "AI 分析完成" });
-        toast.showToast("AI 已生成推荐规则，请确认", "info");
+        setProgress({ current: 100, total: 100, text: "分析完成，建议核对列映射" });
+        toast.showToast("分析完成，建议核对列映射是否准确", "info");
       }
     } catch (err: any) {
-      toast.showToast(`AI 分析失败: ${err.message}`, "error");
+      toast.showToast(`分析失败: ${err.message}`, "error");
       setStep("rule-select");
     }
   };
