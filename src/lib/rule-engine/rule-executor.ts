@@ -7,15 +7,15 @@ import type { RawFile, RawSheet } from "./file-parser";
 
 // 常见字段的同义词映射（用于增强模糊匹配）
 const FIELD_SYNONYMS: Record<string, string[]> = {
-  "SKU物品编码": ["编码", "物品编码", "SKU编码", "产品编码", "货号", "物料编码", "商品编码", "Code", "ItemCode", "ProductCode"],
-  "SKU物品名称": ["名称", "物品名称", "SKU名称", "产品名称", "品名", "商品名称", "Name", "ItemName", "ProductName"],
+  "SKU物品编码": ["编码", "物品编码", "SKU编码", "产品编码", "货号", "物料编码", "商品编码", "Code", "ItemCode", "ProductCode", "Item Code", "Product Code"],
+  "SKU物品名称": ["名称", "物品名称", "SKU名称", "产品名称", "品名", "商品名称", "Name", "ItemName", "ProductName", "Item Name", "Product Name"],
   "SKU发货数量": ["数量", "发货数量", "出库数量", "需求数量", "件数", "Qty", "Quantity", "Amount"],
   "SKU规格型号": ["规格", "规格型号", "型号", "尺寸", "参数", "Spec", "Specification"],
-  "收件人姓名": ["收货人", "收件人", "联系人", "接收人", "客户", "Receiver", "Contact"],
-  "收件人电话": ["电话", "手机", "联系电话", "手机号码", "联系方式", "Phone", "Tel"],
-  "收件人地址": ["地址", "收货地址", "配送地址", "邮寄地址", "Address"],
+  "收件人姓名": ["收货人", "收件人", "联系人", "接收人", "客户", "Receiver", "Contact", "收货人姓名"],
+  "收件人电话": ["电话", "手机", "联系电话", "手机号码", "联系方式", "Phone", "Tel", "收货电话", "联系电话"],
+  "收件人地址": ["地址", "收货地址", "配送地址", "邮寄地址", "Address", "收货地址"],
   "收货门店": ["门店", "店铺", "仓库", "机构", "网点", "站点", "Store", "Shop"],
-  "外部编码": ["配送单号", "外部编码", "订单号", "单号", "运单号", "出库单号", "批次号", "OrderNo", "OrderNumber"],
+  "外部编码": ["配送单号", "外部编码", "订单号", "单号", "运单号", "出库单号", "批次号", "OrderNo", "OrderNumber", "单据号", "发货单号"],
   "备注": ["备注", "说明", "备注信息", "摘要", "Remark", "Note", "Comment"],
 };
 
@@ -120,15 +120,29 @@ function findColumnIndex(sheet: RawSheet, headerRow: number, fieldName: string, 
     }
   }
 
-  // Step 2: Fuzzy match (contains)
+  // Step 2: Fuzzy match (fieldName is contained in cell value)
+  // 但要优先匹配更精确的列名（长度更接近的），避免"编码"先匹配到"外部编码"而非"物品编码"
   if (fieldName.length >= 2) {
+    let bestCol = -1;
+    let bestScore = Infinity; // 越小越好（长度差越小越精确）
     for (let c = 0; c < row.length; c++) {
-      if (row[c] !== null && String(row[c]).trim().includes(fieldName)) return c;
+      if (row[c] === null) continue;
+      const cellVal = String(row[c]).trim();
+      if (cellVal.includes(fieldName)) {
+        // 精确度分 = 列名长度 - fieldName长度，越小越精确
+        const score = Math.abs(cellVal.length - fieldName.length);
+        if (score < bestScore) {
+          bestScore = score;
+          bestCol = c;
+        }
+      }
     }
+    if (bestCol >= 0) return bestCol;
   }
 
-  // Step 3: Reverse fuzzy (header contains fieldName keyword)
+  // Step 3: Reverse fuzzy (cell value is contained in fieldName)
   // 增加长度限制：列头通常较短（<=30字符），避免把包含关键词的长文本值误判为列头
+  // 同时要求 cell 长度 >= 2，避免单字误匹配
   if (normalizedField.length >= 2) {
     for (let c = 0; c < row.length; c++) {
       const val = row[c];
@@ -136,7 +150,7 @@ function findColumnIndex(sheet: RawSheet, headerRow: number, fieldName: string, 
       const strVal = String(val).trim();
       if (strVal.length > 30) continue; // 跳过太长的单元格（不是列头）
       const cell = normalizeStr(strVal);
-      if (cell && (cell.includes(normalizedField) || normalizedField.includes(cell))) return c;
+      if (cell && cell.length >= 2 && (cell.includes(normalizedField) || normalizedField.includes(cell))) return c;
     }
   }
 
@@ -248,6 +262,9 @@ function parseSheet(rule: ParseRule, sheet: RawSheet, _sheetName: string): Parse
     // Skip PAGE BREAK rows (PDF format)
     if (row.some((c) => c !== null && String(c).startsWith("--- PAGE BREAK"))) continue;
 
+    // Skip 元数据/标签行（如 "上游单据: DH2512220006"）
+    if (isMetadataRow(row)) continue;
+
     // Skip 合计/总计/汇总/小计行 — 扫描整行所有单元格
     if (isSummaryRow(row)) continue;
 
@@ -315,6 +332,23 @@ function parseSheet(rule: ParseRule, sheet: RawSheet, _sheetName: string): Parse
     if (!order.SKU物品编码 && !order.SKU物品名称?.trim()) continue;
 
     orders.push(order);
+  }
+
+  // 自动生成外部编码：如果所有订单都没有外部编码（文件中没有单号列），
+  // 则用 "文件名-序号" 格式自动生成，确保每条数据都有唯一标识
+  if (orders.length > 0) {
+    const hasAnyExternalCode = orders.some(o => {
+      const code = (o as any)["外部编码"];
+      return code && String(code).trim() !== "";
+    });
+    if (!hasAnyExternalCode) {
+      // 生成一个短文件标识（取文件名前8字符，去掉扩展名）
+      const fileTag = _sheetName.replace(/\.[^.]+$/, "").substring(0, 8).replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g, "");
+      for (let i = 0; i < orders.length; i++) {
+        (orders[i] as any)["外部编码"] = `${fileTag}-${String(i + 1).padStart(3, "0")}`;
+      }
+      console.log(`[parseSheet] Auto-generated 外部编码 for ${orders.length} orders (prefix: ${fileTag})`);
+    }
   }
 
   return orders;
@@ -402,6 +436,65 @@ function findColumnByTargetField(sheet: RawSheet, headerRow: number, targetField
   return -1;
 }
 
+// 检测一行是否为元数据/标签行（如 "上游单据 | DH2512220006" 这种不是真实数据行的）
+// 注意：此函数仅在数据行处理中调用（headerRow+1 之后），不会影响表头行检测
+function isMetadataRow(row: (string | number | null)[]): boolean {
+  if (!row || row.length === 0) return false;
+
+  // 严格的元数据标签：只包含文档级别信息的关键词
+  // 注意：不包含"收货人"、"电话"等可能出现在数据行中的字段
+  const metadataLabels = [
+    "上游单据", "下游单据", "单据类型", "单据号", "单据编号",
+    "制单人", "审核人", "记账人",
+    "制单日期", "审核日期",
+    "Delivery Order", "Order No", "Status", "Order Date", "Delivery Date",
+    "Ship To", "Bill To",
+  ];
+
+  const rowStr = row.map(c => (c === null ? "" : String(c))).join("");
+  const nonEmptyCount = row.filter(c => c !== null && String(c).trim() !== "").length;
+
+  // 如果整行包含日期格式 (2025/12/22 或 2025-12-22)，且列数 <= 4
+  const hasDate = /\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2}/.test(rowStr);
+
+  // 如果某单元格是纯粹的元数据标签文字，或者以元数据标签开头
+  for (const c of row) {
+    if (c === null || c === "") continue;
+    const s = String(c).trim();
+    if (metadataLabels.some(lbl => s === lbl || s.startsWith(lbl + ":") || s.startsWith(lbl + "：") || s.startsWith(lbl + " "))) {
+      console.log(`[isMetadataRow] Skipping metadata row (label "${s}")`);
+      return true;
+    }
+  }
+
+  // 如果某单元格是标准的订单号格式 (如 DH2512220006)
+  // 且同行还有日期，则这行可能是元数据而非 SKU 数据
+  if (hasDate && nonEmptyCount <= 4) {
+    const hasOrderNo = row.some(c => c !== null && /^[A-Z]{2}\d{10,}$/.test(String(c).trim()));
+    if (hasOrderNo) {
+      console.log(`[isMetadataRow] Skipping metadata row (order+date pattern)`);
+      return true;
+    }
+  }
+
+  // 如果一行中大部分内容都是"标签:值"格式（如 "收货单位: XXX" "收货电话: 123" 或 "Receiver: Zhang San"），
+  // 且没有"编码"类关键词，则判定为元数据行
+  const colonPatternCount = row.filter(c => {
+    if (c === null || c === "") return false;
+    const s = String(c).trim();
+    // 匹配 "标签：值" 或 "标签:值" 格式（中文2-8字符或英文2-15字符）
+    return /^[^\d]{2,8}[：:]\s*.+$/.test(s) ||     // 中文标签
+           /^[A-Za-z]{2,15}:\s*.+$/.test(s);        // 英文标签 (Receiver:, Phone:, Address: 等)
+  }).length;
+  // 如果超过半数的非空单元格都是"标签:值"格式，且行中没有编码类关键词
+  if (colonPatternCount >= 1 && colonPatternCount >= nonEmptyCount / 2 && !rowStr.includes("编码")) {
+    console.log(`[isMetadataRow] Skipping metadata row (colon pattern: ${colonPatternCount}/${nonEmptyCount})`);
+    return true;
+  }
+
+  return false;
+}
+
 // 检测一行是否为汇总/合计/统计行（非数据行）
 function isSummaryRow(row: (string | number | null)[]): boolean {
   if (!row || row.length === 0) return false;
@@ -410,6 +503,7 @@ function isSummaryRow(row: (string | number | null)[]): boolean {
   const summaryKeywords = [
     "合计", "总计", "共计", "小计", "累计", "汇总",
     "总调拨数量", "总数量", "总金额",
+    "Total", "Subtotal", "Sum", "Summary", "Grand Total",
   ];
 
   // 汇总行模式：如 "3 个门店 | 9 种物品 | 总调拨数量：44 件/包"
@@ -425,10 +519,11 @@ function isSummaryRow(row: (string | number | null)[]): boolean {
     const val = row[c];
     if (val === null || val === "") continue;
     const strVal = String(val).trim();
+    const strValLower = strVal.toLowerCase();
 
     // 检查关键词
     for (const kw of summaryKeywords) {
-      if (strVal.includes(kw)) {
+      if (strValLower.includes(kw.toLowerCase())) {
         console.log(`[isSummaryRow] Skipping summary row (keyword "${kw}" in col ${c}): "${strVal.substring(0, 60)}"`);
         return true;
       }
@@ -1094,6 +1189,22 @@ export async function executeRule(rule: ParseRule, rawFile: RawFile): Promise<Pa
   // Apply cell split (post-processing)
   if (rule.cellSplit?.enabled) {
     orders = applyCellSplit(rule, orders);
+  }
+
+  // 最终兜底：如果所有订单都没有外部编码，自动生成
+  // 这确保每条数据都有唯一标识，用于后续的聚合和出库单展示
+  if (orders.length > 0) {
+    const hasAnyExternalCode = orders.some(o => {
+      const code = (o as any)["外部编码"];
+      return code && String(code).trim() !== "";
+    });
+    if (!hasAnyExternalCode) {
+      const fileTag = rule.name?.replace(/\.[^.]+$/, "").substring(0, 8).replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g, "") || "ORD";
+      for (let i = 0; i < orders.length; i++) {
+        (orders[i] as any)["外部编码"] = `${fileTag}-${String(i + 1).padStart(3, "0")}`;
+      }
+      console.log(`[executeRule] Auto-generated 外部编码 for ${orders.length} orders (prefix: ${fileTag})`);
+    }
   }
 
   return orders;

@@ -360,7 +360,8 @@ function localAnalyze(
             (cl.includes("规格") || cl.includes("型号") || cl === "spec" || cl.includes("specification"))) {
           mapping = { sourceField: col, targetField: "SKU规格型号", aiConfidence: 0.7 };
         } else if (!mappedTargets.has("外部编码") &&
-            (cl.includes("单号") || cl.includes("配送") || cl.includes("订单") || cl.includes("order") || cl.includes("orderno"))) {
+            (cl.includes("单号") || cl.includes("配送号") || cl.includes("订单号") || cl.includes("运单号") ||
+             cl.includes("单据号") || cl.includes("批次号") || cl.includes("orderno") || cl.includes("order_number"))) {
           mapping = { sourceField: col, targetField: "外部编码", aiConfidence: 0.8 };
         } else if (!mappedTargets.has("收件人姓名") &&
             (cl.includes("收货人") || cl.includes("收件人") || cl.includes("receiver") || cl.includes("contact"))) {
@@ -513,31 +514,35 @@ function localAnalyze(
     const cl = col.toLowerCase().replace(/[*\s·・]/g, "");
     let mapping: any = null;
 
-    // 优先级1: 外部编码（单号类）
-    if (!mappedTargets.has("外部编码") &&
-        ((cl.includes("编码") && !cl.includes("sku") && !cl.includes("物品") && !cl.includes("商品")) ||
-         cl.includes("单号") || cl.includes("订单") || cl.includes("配送号") || cl.includes("运单"))) {
-      mapping = { sourceField: col, targetField: "外部编码", aiConfidence: 0.8 };
-    }
-    // 优先级2: SKU物品编码
-    else if (!mappedTargets.has("SKU物品编码") &&
-             (cl.includes("物品编码") || cl.includes("sku编码") || cl.includes("产品编码") || cl.includes("货号") || cl === "编码")) {
+    // 优先级1: SKU物品编码（最核心字段，必须优先匹配）
+    // "编码"单独出现时优先认为是SKU编码，而非单号
+    if (!mappedTargets.has("SKU物品编码") &&
+        (cl === "编码" || cl.includes("物品编码") || cl.includes("sku编码") || cl.includes("产品编码") || cl.includes("货号") || cl.includes("物料编码") || cl.includes("商品编码"))) {
       mapping = { sourceField: col, targetField: "SKU物品编码", isRequired: true, aiConfidence: 0.9 };
     }
-    // 优先级3: SKU物品名称
+    // 优先级2: SKU物品名称
     else if (!mappedTargets.has("SKU物品名称") &&
-             (cl.includes("物品名称") || cl.includes("sku名称") || cl.includes("产品名称") || cl.includes("品名") || cl === "名称")) {
+             (cl === "名称" || cl.includes("物品名称") || cl.includes("sku名称") || cl.includes("产品名称") || cl.includes("品名") || cl.includes("商品名称"))) {
       mapping = { sourceField: col, targetField: "SKU物品名称", isRequired: true, aiConfidence: 0.9 };
     }
-    // 优先级4: SKU发货数量
+    // 优先级3: SKU发货数量
     else if (!mappedTargets.has("SKU发货数量") &&
              (cl.includes("数量") || cl.includes("发货") || cl.includes("出库") || cl.includes("件数"))) {
       mapping = { sourceField: col, targetField: "SKU发货数量", isRequired: true, transform: "toNumber", aiConfidence: 0.9 };
     }
-    // 优先级5: SKU规格型号
+    // 优先级4: SKU规格型号
     else if (!mappedTargets.has("SKU规格型号") &&
              (cl.includes("规格") || cl.includes("型号"))) {
       mapping = { sourceField: col, targetField: "SKU规格型号", aiConfidence: 0.7 };
+    }
+    // 优先级5: 外部编码（必须是明确的单号类词，"编码"单独不算）
+    // 配送单号、订单号、运单号、出库单号、单据号、批次号 才是单号
+    // "编码"已归到SKU物品编码，这里排除
+    else if (!mappedTargets.has("外部编码") &&
+             (cl.includes("单号") || cl.includes("配送号") || cl.includes("订单号") ||
+              cl.includes("运单号") || cl.includes("出库单号") || cl.includes("单据号") ||
+              cl.includes("批次号") || cl.includes("orderno") || cl.includes("order_number"))) {
+      mapping = { sourceField: col, targetField: "外部编码", aiConfidence: 0.8 };
     }
     // 优先级6: 收货门店
     else if (!mappedTargets.has("收货门店") &&
@@ -574,7 +579,8 @@ function localAnalyze(
   if (!mappedTargets.has("外部编码")) {
     for (const col of columns) {
       const cl = col.toLowerCase().replace(/[*\s·・]/g, "");
-      if (cl.includes("单号") || cl.includes("配送") || cl.includes("订单")) {
+      if (cl.includes("单号") || cl.includes("配送号") || cl.includes("订单号") ||
+          cl.includes("运单号") || cl.includes("单据号") || cl.includes("批次号")) {
         mappings.push({ sourceField: col, targetField: "外部编码", aiConfidence: 0.7 });
         mappedTargets.add("外部编码");
         break;
@@ -585,7 +591,7 @@ function localAnalyze(
   // 检测是否需要跨行聚合（看是否有"配送单号"或"单号"列）
   const hasGroupBy = columns.some((c) => {
     const cl = c.toLowerCase().replace(/[*\s·・]/g, "");
-    return cl.includes("单号") || cl.includes("配送");
+    return cl.includes("单号") || cl.includes("配送号") || cl.includes("订单号") || cl.includes("运单号");
   });
   if (hasGroupBy) {
     rule.aggregation = {
