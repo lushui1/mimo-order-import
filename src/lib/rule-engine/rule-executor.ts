@@ -7,16 +7,16 @@ import type { RawFile, RawSheet } from "./file-parser";
 
 // 常见字段的同义词映射（用于增强模糊匹配）
 const FIELD_SYNONYMS: Record<string, string[]> = {
-  "SKU物品编码": ["编码", "物品编码", "SKU编码", "产品编码", "货号", "物料编码", "商品编码"],
-  "SKU物品名称": ["名称", "物品名称", "SKU名称", "产品名称", "品名", "商品名称"],
-  "SKU发货数量": ["数量", "发货数量", "出库数量", "需求数量", "件数"],
-  "SKU规格型号": ["规格", "规格型号", "型号", "尺寸", "参数"],
-  "收件人姓名": ["收货人", "收件人", "联系人", "接收人", "客户"],
-  "收件人电话": ["电话", "手机", "联系电话", "手机号码", "联系方式"],
-  "收件人地址": ["地址", "收货地址", "配送地址", "邮寄地址"],
-  "收货门店": ["门店", "店铺", "仓库", "机构", "网点", "站点"],
-  "外部编码": ["配送单号", "外部编码", "订单号", "单号", "运单号", "出库单号", "批次号"],
-  "备注": ["备注", "说明", "备注信息", "摘要"],
+  "SKU物品编码": ["编码", "物品编码", "SKU编码", "产品编码", "货号", "物料编码", "商品编码", "Code", "ItemCode", "ProductCode"],
+  "SKU物品名称": ["名称", "物品名称", "SKU名称", "产品名称", "品名", "商品名称", "Name", "ItemName", "ProductName"],
+  "SKU发货数量": ["数量", "发货数量", "出库数量", "需求数量", "件数", "Qty", "Quantity", "Amount"],
+  "SKU规格型号": ["规格", "规格型号", "型号", "尺寸", "参数", "Spec", "Specification"],
+  "收件人姓名": ["收货人", "收件人", "联系人", "接收人", "客户", "Receiver", "Contact"],
+  "收件人电话": ["电话", "手机", "联系电话", "手机号码", "联系方式", "Phone", "Tel"],
+  "收件人地址": ["地址", "收货地址", "配送地址", "邮寄地址", "Address"],
+  "收货门店": ["门店", "店铺", "仓库", "机构", "网点", "站点", "Store", "Shop"],
+  "外部编码": ["配送单号", "外部编码", "订单号", "单号", "运单号", "出库单号", "批次号", "OrderNo", "OrderNumber"],
+  "备注": ["备注", "说明", "备注信息", "摘要", "Remark", "Note", "Comment"],
 };
 
 // 规范化字符串：去掉 *、空格、特殊字符，转小写
@@ -244,6 +244,9 @@ function parseSheet(rule: ParseRule, sheet: RawSheet, _sheetName: string): Parse
 
     // Skip empty rows
     if (!row || row.every((c) => c === null || c === "")) continue;
+
+    // Skip PAGE BREAK rows (PDF format)
+    if (row.some((c) => c !== null && String(c).startsWith("--- PAGE BREAK"))) continue;
 
     // Skip 合计/总计/汇总/小计行 — 扫描整行所有单元格
     if (isSummaryRow(row)) continue;
@@ -898,8 +901,15 @@ function splitPdfOrders(rule: ParseRule, fileText: string, rawFile: RawFile): Pa
   const { orderSeparator } = rule.pdfConfig;
   if (!orderSeparator) return [];
 
-  // Split text by separator
-  const sections = fileText.split(orderSeparator).filter((s) => s.trim());
+  // Split text by separator - support regex-like OR patterns (e.g., "签收人|收货人")
+  let sections: string[];
+  try {
+    const separatorRegex = new RegExp(orderSeparator);
+    sections = fileText.split(separatorRegex).filter((s) => s.trim());
+  } catch {
+    // Fallback: treat as literal string
+    sections = fileText.split(orderSeparator).filter((s) => s.trim());
+  }
 
   const allOrders: ParsedOrder[] = [];
 
@@ -1007,8 +1017,8 @@ export async function executeRule(rule: ParseRule, rawFile: RawFile): Promise<Pa
     headerRow: rule.header?.headerRow,
   });
 
-  // PDF 多订单切分（优先处理）
-  if (rule.pdfConfig?.multiOrder && rawFile.fileType === "pdf") {
+  // PDF 多订单切分（仅在明确启用 multiOrder 时生效）
+  if (rule.pdfConfig?.multiOrder && rule.pdfConfig.orderSeparator && rawFile.fileType === "pdf") {
     const fileText = rawFile.sheets.map((s) =>
       s.rows.map((r) => r.map((c) => (c === null ? "" : String(c))).join("\t")).join("\n")
     ).join("\n");
@@ -1016,6 +1026,8 @@ export async function executeRule(rule: ParseRule, rawFile: RawFile): Promise<Pa
     if (pdfOrders.length > 0) {
       return pdfOrders;
     }
+    // 多订单切分失败，继续走标准 parseSheet 路径
+    console.warn("[executeRule] PDF multiOrder split failed, falling back to parseSheet");
   }
 
   // Word 纯文本解析

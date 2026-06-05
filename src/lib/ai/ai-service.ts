@@ -308,7 +308,8 @@ function localAnalyze(
       if (cols.length < 2) continue;
 
       let score = 0;
-      const headerKeywords = ["编码", "名称", "数量", "规格", "物品", "序号", "收货", "电话", "地址", "门店"];
+      const headerKeywords = ["编码", "名称", "数量", "规格", "物品", "序号", "收货", "电话", "地址", "门店",
+                               "code", "name", "qty", "quantity", "spec", "remark", "item"];
       for (const col of cols) {
         const cl = col.toLowerCase().replace(/[*\s·・]/g, "");
         for (const kw of headerKeywords) {
@@ -345,32 +346,37 @@ function localAnalyze(
         let mapping: any = null;
 
         if (!mappedTargets.has("SKU物品编码") &&
-            (cl.includes("物品编码") || cl.includes("sku编码") || cl.includes("产品编码") || cl === "编码" || cl.includes("序号"))) {
+            (cl.includes("物品编码") || cl.includes("sku编码") || cl.includes("产品编码") || cl === "编码" || cl.includes("序号") ||
+             cl === "code" || cl.includes("itemcode") || cl.includes("item_code") || cl.includes("productcode"))) {
           mapping = { sourceField: col, targetField: "SKU物品编码", isRequired: true, aiConfidence: 0.9 };
         } else if (!mappedTargets.has("SKU物品名称") &&
-            (cl.includes("物品名称") || cl.includes("sku名称") || cl.includes("产品名称") || cl.includes("品名") || cl === "名称")) {
+            (cl.includes("物品名称") || cl.includes("sku名称") || cl.includes("产品名称") || cl.includes("品名") || cl === "名称" ||
+             cl === "name" || cl.includes("itemname") || cl.includes("item_name") || cl.includes("productname"))) {
           mapping = { sourceField: col, targetField: "SKU物品名称", isRequired: true, aiConfidence: 0.9 };
         } else if (!mappedTargets.has("SKU发货数量") &&
-            (cl.includes("数量") || cl.includes("件数"))) {
+            (cl.includes("数量") || cl.includes("件数") || cl === "qty" || cl === "quantity" || cl.includes("amount"))) {
           mapping = { sourceField: col, targetField: "SKU发货数量", isRequired: true, transform: "toNumber", aiConfidence: 0.9 };
         } else if (!mappedTargets.has("SKU规格型号") &&
-            (cl.includes("规格") || cl.includes("型号"))) {
+            (cl.includes("规格") || cl.includes("型号") || cl === "spec" || cl.includes("specification"))) {
           mapping = { sourceField: col, targetField: "SKU规格型号", aiConfidence: 0.7 };
         } else if (!mappedTargets.has("外部编码") &&
-            (cl.includes("单号") || cl.includes("配送") || cl.includes("订单"))) {
+            (cl.includes("单号") || cl.includes("配送") || cl.includes("订单") || cl.includes("order") || cl.includes("orderno"))) {
           mapping = { sourceField: col, targetField: "外部编码", aiConfidence: 0.8 };
         } else if (!mappedTargets.has("收件人姓名") &&
-            (cl.includes("收货人") || cl.includes("收件人"))) {
+            (cl.includes("收货人") || cl.includes("收件人") || cl.includes("receiver") || cl.includes("contact"))) {
           mapping = { sourceField: col, targetField: "收件人姓名", aiConfidence: 0.7 };
         } else if (!mappedTargets.has("收件人电话") &&
-            (cl.includes("电话") || cl.includes("手机"))) {
+            (cl.includes("电话") || cl.includes("手机") || cl.includes("phone") || cl.includes("tel"))) {
           mapping = { sourceField: col, targetField: "收件人电话", aiConfidence: 0.7 };
         } else if (!mappedTargets.has("收件人地址") &&
-            (cl.includes("地址"))) {
+            (cl.includes("地址") || cl.includes("address"))) {
           mapping = { sourceField: col, targetField: "收件人地址", aiConfidence: 0.7 };
         } else if (!mappedTargets.has("收货门店") &&
-            (cl.includes("门店") || cl.includes("店铺"))) {
+            (cl.includes("门店") || cl.includes("店铺") || cl.includes("store") || cl.includes("shop"))) {
           mapping = { sourceField: col, targetField: "收货门店", aiConfidence: 0.7 };
+        } else if (!mappedTargets.has("备注") &&
+            (cl.includes("备注") || cl.includes("remark") || cl.includes("note") || cl.includes("comment"))) {
+          mapping = { sourceField: col, targetField: "备注", aiConfidence: 0.6 };
         }
 
         if (mapping) {
@@ -393,10 +399,16 @@ function localAnalyze(
     }
 
     // 检测是否需要多订单切分（PDF 中包含多个独立签收单）
+    // 仅在明确有多个分隔符出现时才启用，避免误判
     const pageBreakCount = (fileContent.match(/PAGE BREAK/g) || []).length;
-    const receiverKeywords = ["收货人", "签收人", "收件人"];
-    const hasReceiver = lines.some(l => receiverKeywords.some(kw => l.includes(kw)));
-    if (pageBreakCount > 0 && hasReceiver) {
+    const receiverKeywords = ["签收人", "收货人", "收件人"];
+    // 检查分隔符出现次数（至少出现 2 次才认为是多订单）
+    let separatorCount = 0;
+    for (const kw of receiverKeywords) {
+      const matches = fileContent.match(new RegExp(kw, "g"));
+      separatorCount += matches ? matches.length : 0;
+    }
+    if (pageBreakCount > 0 && separatorCount >= 2) {
       rule.pdfConfig = {
         headerSkipLines: actualHeaderRow,
         tableHeaderPattern: detectTableHeader(lines),

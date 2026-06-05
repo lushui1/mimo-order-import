@@ -93,8 +93,6 @@ async function parsePdf(buffer: ArrayBuffer): Promise<RawSheet[]> {
   const pdfjsLib = await import("pdfjs-dist");
 
   // 设置 Worker：使用 CDN 版本对应的 pdf.worker.mjs
-  // pdfjs-dist 4.x 在浏览器端需要配置 worker，否则抛出 "No GlobalWorkerOptions.workerSrc" 错误
-  // 方案1：使用 CDN 上对应版本的 worker
   const pdfjsVersion = pdfjsLib.version || "4.10.38";
   pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsVersion}/pdf.worker.min.mjs`;
 
@@ -104,31 +102,90 @@ async function parsePdf(buffer: ArrayBuffer): Promise<RawSheet[]> {
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    let lastY: number | null = null;
-    let lineText = "";
-    const lines: string[] = [];
 
-    for (const item of content.items as { str: string; transform: number[] }[]) {
-      const y = Math.round(item.transform[5]);
-      if (lastY !== null && Math.abs(y - lastY) > 2) {
-        if (lineText.trim()) lines.push(lineText.trim());
-        lineText = "";
-      }
-      lineText += item.str;
-      lastY = y;
+    // 收集所有文本项，按 Y 坐标分行，按 X 坐标分列
+    interface TextItem {
+      str: string;
+      x: number;  // transform[4] - X 坐标
+      y: number;  // transform[5] - Y 坐标
+      width: number;
     }
-    if (lineText.trim()) lines.push(lineText.trim());
 
-    const rows = lines.map((l) => {
-      const parts = l.split(/\s{2,}/).map((s) => s.trim());
-      return parts.length > 1 ? parts : [l];
-    });
+    const items: TextItem[] = [];
+    for (const item of content.items as { str: string; transform: number[]; width?: number }[]) {
+      if (!item.str || !item.str.trim()) continue;
+      items.push({
+        str: item.str.trim(),
+        x: Math.round(item.transform[4]),
+        y: Math.round(item.transform[5]),
+        width: item.width || 0,
+      });
+    }
 
-    const allRows: (string | null)[][] = rows.map((r) => r.map((s) => s || null));
+    if (items.length === 0) {
+      pages.push({ text: "", rows: [] });
+      continue;
+    }
+
+    // 按 Y 坐标分行（允许 ±3 像素误差）
+    const yGroups: TextItem[][] = [];
+    let currentGroup: TextItem[] = [items[0]];
+    let currentY = items[0].y;
+
+    for (let j = 1; j < items.length; j++) {
+      if (Math.abs(items[j].y - currentY) <= 3) {
+        currentGroup.push(items[j]);
+      } else {
+        yGroups.push(currentGroup);
+        currentGroup = [items[j]];
+        currentY = items[j].y;
+      }
+    }
+    yGroups.push(currentGroup);
+
+    // 对每行：按 X 坐标排序，然后用 X 间距分列
+    const lines: string[] = [];
+    const rows: (string | null)[][] = [];
+
+    for (const group of yGroups) {
+      // 按 X 排序
+      group.sort((a, b) => a.x - b.x);
+
+      // 用 X 间距分列：如果两个相邻项的 X 间距 > 平均字符宽度的 2 倍，认为是不同列
+      const cols: string[] = [];
+      let colText = group[0].str;
+      let lastX = group[0].x;
+      let lastWidth = group[0].width || group[0].str.length * 8; // 估计宽度
+
+      for (let k = 1; k < group.length; k++) {
+        const gap = group[k].x - (lastX + lastWidth);
+        // 间距 > 8px 认为是新列（约 1 个中文字符宽度）
+        if (gap > 8) {
+          cols.push(colText.trim());
+          colText = group[k].str;
+        } else {
+          // 同列内，文本拼接
+          colText += group[k].str;
+        }
+        lastX = group[k].x;
+        lastWidth = group[k].width || group[k].str.length * 8;
+      }
+      if (colText.trim()) cols.push(colText.trim());
+
+      // 行文本（用于 footerExtraction 等纯文本搜索）
+      lines.push(cols.join("  "));
+
+      // 行数据
+      if (cols.length > 1) {
+        rows.push(cols.map(s => s || null));
+      } else {
+        rows.push([cols[0] || null]);
+      }
+    }
 
     pages.push({
       text: lines.join("\n"),
-      rows: allRows,
+      rows,
     });
   }
 

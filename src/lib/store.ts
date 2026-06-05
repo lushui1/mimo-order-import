@@ -19,13 +19,21 @@ export function getRules(): ParseRule[] {
   }
 }
 
-export function saveRule(rule: ParseRule): { success: boolean; error?: string } {
+export function saveRule(rule: ParseRule): { success: boolean; error?: string; reused?: boolean } {
   const rules = getRules();
   
-  // 同名检查
-  const duplicate = rules.find((r) => r.name === rule.name && r.id !== rule.id);
-  if (duplicate) {
-    return { success: false, error: `规则"${rule.name}"已存在` };
+  // 去重复用：检查是否有完全相同列映射的规则（sourceField+targetField 完全一致）
+  // 如果生成的规则与已有规则映射一致，直接复用已有规则，不报错
+  const duplicateByName = rules.find((r) => r.name === rule.name && r.id !== rule.id);
+  if (duplicateByName) {
+    // 同名规则：检查列映射是否一致
+    const sameMappings = isSameMappings(duplicateByName.columnMappings, rule.columnMappings);
+    if (sameMappings) {
+      // 映射一致 → 直接复用，不报错
+      return { success: true, reused: true };
+    }
+    // 同名但映射不同 → 改名后保存
+    rule = { ...rule, name: `${rule.name} (${new Date().toLocaleTimeString()})` };
   }
   
   const idx = rules.findIndex((r) => r.id === rule.id);
@@ -40,6 +48,15 @@ export function saveRule(rule: ParseRule): { success: boolean; error?: string } 
   syncRuleToServer(rule);
   
   return { success: true };
+}
+
+// 检查两组列映射是否语义一致
+function isSameMappings(a: ParseRule["columnMappings"], b: ParseRule["columnMappings"]): boolean {
+  if (a.length !== b.length) return false;
+  const keyOf = (m: ParseRule["columnMappings"][0]) => `${m.sourceField}→${m.targetField}`;
+  const aKeys = new Set(a.map(keyOf));
+  const bKeys = b.map(keyOf);
+  return bKeys.every(k => aKeys.has(k));
 }
 
 export function checkRuleNameDuplicate(name: string, excludeId?: string): boolean {

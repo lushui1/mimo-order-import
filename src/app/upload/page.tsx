@@ -167,7 +167,18 @@ export default function UploadPage() {
       setStep("rule-select");
       return;
     }
-    setSelectedRule(newRule);
+    // 规则去重复用：如果映射一致直接复用已有规则
+    if (result.reused) {
+      // 找到同名规则直接选中
+      const existingRule = getRules().find(r => r.name === newRule.name);
+      if (existingRule) {
+        setSelectedRule(existingRule);
+      } else {
+        setSelectedRule(newRule);
+      }
+    } else {
+      setSelectedRule(newRule);
+    }
     setShowAiResult(false);
     refreshRules();
     toast.showToast(isFallback ? "本地分析规则已保存并选中" : "AI 规则已保存并选中", "success");
