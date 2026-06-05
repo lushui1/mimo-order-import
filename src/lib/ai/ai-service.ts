@@ -20,17 +20,20 @@ export async function analyzeFileAndGenerateRule(
     return localAnalyze(fileContent, fileName, fileType);
   }
 
-  // 先用本地分析兜底（<100ms），避免 Vercel 10s 超时杀死函数
+  // 先用本地分析兜底（<100ms），避免 AI 超时时无结果可返回
   const localResult = localAnalyze(fileContent, fileName, fileType);
 
   try {
-    const prompt = buildAnalysisPrompt(fileContent, fileName, fileType);
+    // 新策略：把本地分析结果给 AI 审核，而不是让 AI 从零生成
+    // 这样 AI 只需做"修正"而非"生成"，大幅减少 reasoning 工作量
+    const prompt = buildReviewPrompt(fileContent, fileName, fileType, localResult);
 
-    console.log(`[AI] Calling ${AI_MODEL} at ${API_BASE} (streaming mode)...`);
+    console.log(`[AI] Calling ${AI_MODEL} at ${API_BASE} (review mode, streaming)...`);
     const startTime = Date.now();
 
-    // Vercel hobby plan maxDuration=60s, 设 55s 超时，留 5s 给返回处理
-    const AI_TIMEOUT_MS = 55000;
+    // Vercel hobby plan maxDuration=60s, 设 30s 超时
+    // AI 审核模式应该很快（<15s），30s 是安全上限
+    const AI_TIMEOUT_MS = 30000;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
@@ -124,53 +127,10 @@ export async function analyzeFileAndGenerateRule(
   }
 }
 
-// ===== System Prompt：给AI非常明确的指令和示例 =====
-const SYSTEM_PROMPT = `你是一个物流出库单解析规则生成器。你的任务 ONLY 是分析用户提供的文件内容，输出一个 JSON 格式的解析规则。
-
-## 输入格式说明
-- 每行格式："行N: 列1 | 列2 | 列3 | ..."
-- "行N" 中的 N 是 0-based 行号（即Excel第1行 = 行0）
-- 多个 Sheet 用 "--- Sheet: 名称 ---" 分隔
-- 文件头部可能有标题行（如"XX发货明细"），不是表头
-
-## 你必须做的事情
-1. 找出真正的表头行（包含"编码/名称/数量"等列名的行），不是标题行
-2. 将文件中的列名映射到标准目标字段
-3. 检测特殊结构（尾部收货信息、跨行聚合、矩阵转置、多Sheet）
-
-## 目标字段（targetField）列表
-- SKU物品编码（必填）
-- SKU物品名称（必填）
-- SKU发货数量（必填，transform填"toNumber"）
-- SKU规格型号
-- 外部编码（配送单号/订单号/单号）
-- 收货门店
-- 收件人姓名
-- 收件人电话
-- 收件人地址
-- 备注
-
-## 输出要求
-- 必须返回合法的 JSON，不要任何 Markdown 代码块标记
-- columnMappings 绝对不能为空数组
-- headerRow 必须是包含列名的行号，不能是标题行
-- sourceField 必须填写文件中的实际列名，不能留空
-
-## 输出格式示例
-{
-  "header": {"skipRows": 2, "headerRow": 2},
-  "columnMappings": [
-    {"sourceField": "配送单号", "targetField": "外部编码", "aiConfidence": 0.9},
-    {"sourceField": "物品编码", "targetField": "SKU物品编码", "isRequired": true, "aiConfidence": 0.9},
-    {"sourceField": "物品名称", "targetField": "SKU物品名称", "isRequired": true, "aiConfidence": 0.9},
-    {"sourceField": "规格型号", "targetField": "SKU规格型号", "aiConfidence": 0.8},
-    {"sourceField": "数量", "targetField": "SKU发货数量", "isRequired": true, "transform": "toNumber", "aiConfidence": 0.9},
-    {"sourceField": "收货人", "targetField": "收件人姓名", "aiConfidence": 0.8},
-    {"sourceField": "电话", "targetField": "收件人电话", "aiConfidence": 0.8},
-    {"sourceField": "地址", "targetField": "收件人地址", "aiConfidence": 0.8}
-  ],
-  "aggregation": {"enabled": true, "groupByField": "外部编码", "sharedFields": ["收件人姓名", "收件人电话", "收件人地址"]}
-}`;
+// ===== System Prompt：极简指令，让 AI 做最少的工作 =====
+const SYSTEM_PROMPT = `你是物流出库单规则审核员。用户已用本地算法生成规则，你只需修正错误。
+输出纯JSON，格式：{"header":{"skipRows":N,"headerRow":N},"columnMappings":[{"sourceField":"列名","targetField":"标准字段","isRequired":bool,"transform":"toNumber"}],"aggregation":{"enabled":true,"groupByField":"外部编码","sharedFields":["收件人姓名","收件人电话","收件人地址"]}}
+标准字段：SKU物品编码,SKU物品名称,SKU发货数量,SKU规格型号,外部编码,收货门店,收件人姓名,收件人电话,收件人地址,备注`;
 
 // ===== 从 AI 响应中提取 JSON =====
 function extractJsonFromAiResponse(content: string): any | null {
@@ -618,23 +578,23 @@ function detectSeparator(lines: string[]): string {
   return "---";
 }
 
-// ===== 构建 AI Prompt（带明确指引）=====
-function buildAnalysisPrompt(
+// ===== 构建 AI 审核提示（极简版，减少 reasoning 开销）=====
+function buildReviewPrompt(
   fileContent: string,
   fileName: string,
-  fileType: string
+  fileType: string,
+  localResult: Partial<ParseRule>
 ): string {
-  return `请分析以下物流出库单文件，生成解析规则。
+  // 只取文件前 600 字符（表头 + 少量数据行就够了）
+  const preview = fileContent.substring(0, 600);
+  
+  // 把本地分析结果序列化为紧凑 JSON
+  const localJson = JSON.stringify(localResult, null, 0);
+  
+  return `文件:${fileName}(${fileType})
+${preview}
 
-文件名: ${fileName}
-文件类型: ${fileType}
+本地规则:${localJson}
 
-文件内容预览：
-${fileContent.substring(0, 2500)}
-
-要求：
-1. 找出真正的表头行（包含列名的行，不是标题行如"XX发货明细"）
-2. 将文件中的列名映射到标准字段：SKU物品编码、SKU物品名称、SKU发货数量、SKU规格型号、外部编码、收货门店、收件人姓名、收件人电话、收件人地址
-3. 如果有"单号"类列，需开启 aggregation（跨行聚合）
-4. 只输出纯 JSON，不要 Markdown 代码块`;
+修正此规则。仅输出JSON。`;
 }

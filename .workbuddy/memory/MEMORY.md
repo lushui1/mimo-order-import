@@ -12,7 +12,7 @@
 - **demo 文件**: 9 份不同格式（Excel 6份、PDF 2份、Word 1份），需全部兼容
 - **数据库**: 使用 @vercel/postgres 实现持久化存储
 - **AI 服务**: 通过服务端 API 路由调用，API Key 不暴露给前端
-- **AI 模型**: mimo-v2.5-pro（TokenPlan/小米），baseUrl: https://token-plan-cn.xiaomimimo.com/v1
+- **AI 模型**: mimo-v2.5（TokenPlan/小米），baseUrl: https://token-plan-cn.xiaomimimo.com/v1
 - **已完成**: 提交流程、AI 服务、历史页面、规则试解析、新增解析模式、外部编码聚合出库单
 - **待完成**: 响应式设计、Vercel 部署优化
 
