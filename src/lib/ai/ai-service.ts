@@ -6,8 +6,9 @@ import type { ParseRule } from "../types";
 import { generateId } from "../store";
 
 // 服务端环境变量（不带 NEXT_PUBLIC_ 前缀）
-const API_BASE = process.env.AI_API_URL || process.env.NEXT_PUBLIC_AI_API_URL || "https://api.deepseek.com/v1";
+const API_BASE = process.env.AI_API_BASE_URL || process.env.AI_API_URL || process.env.NEXT_PUBLIC_AI_API_URL || "https://api.deepseek.com/v1";
 const API_KEY = process.env.AI_API_KEY || process.env.NEXT_PUBLIC_AI_API_KEY || "";
+const AI_MODEL = process.env.AI_MODEL || "mimo-v2.5-pro";
 
 export async function analyzeFileAndGenerateRule(
   fileContent: string,
@@ -28,7 +29,7 @@ export async function analyzeFileAndGenerateRule(
         Authorization: `Bearer ${API_KEY}`,
       },
       body: JSON.stringify({
-        model: "deepseek-chat",
+        model: AI_MODEL,
         messages: [
           {
             role: "system",
