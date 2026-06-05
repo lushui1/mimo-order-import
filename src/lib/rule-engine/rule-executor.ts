@@ -5,13 +5,32 @@
 import type { ParseRule, ParsedOrder } from "./types";
 import type { RawFile, RawSheet } from "./file-parser";
 
-// ----- 从规则获取源列索引 -----
+// ----- 从规则获取源列索引（精确匹配 + 模糊兜底）-----
 function findColumnIndex(sheet: RawSheet, headerRow: number, fieldName: string): number {
   const row = sheet.rows[headerRow];
   if (!row) return -1;
+
+  // Step 1: Exact match (trimmed)
   for (let c = 0; c < row.length; c++) {
     if (row[c] !== null && String(row[c]).trim() === fieldName) return c;
   }
+
+  // Step 2: Fuzzy match (contains)
+  if (fieldName.length >= 2) {
+    for (let c = 0; c < row.length; c++) {
+      if (row[c] !== null && String(row[c]).trim().includes(fieldName)) return c;
+    }
+  }
+
+  // Step 3: Reverse fuzzy (header contains fieldName keyword)
+  const keywords = fieldName.replace(/[*\s]/g, "");
+  if (keywords.length >= 2) {
+    for (let c = 0; c < row.length; c++) {
+      const cell = row[c] !== null ? String(row[c]).trim().replace(/[*\s]/g, "") : "";
+      if (cell && keywords.includes(cell)) return c;
+    }
+  }
+
   return -1;
 }
 
@@ -28,15 +47,32 @@ function parseSheet(rule: ParseRule, sheet: RawSheet, _sheetName: string): Parse
   // Build field → column index mapping
   const fieldMap = new Map<string, { colIndex: number; mapping: typeof columnMappings[0] }>();
 
+  console.log(`[parseSheet] Sheet="${_sheetName}" headerRow=${header.headerRow} dataStartRow=${dataStartRow} totalRows=${sheet.rows.length}`);
+  
+  // Debug: show header row content
+  const hdrRow = sheet.rows[header.headerRow];
+  if (hdrRow) {
+    console.log(`[parseSheet] Header row (first 10 cols):`, hdrRow.slice(0, 10).map(c => c === null ? "NULL" : `"${String(c).trim()}"`));
+  } else {
+    console.log(`[parseSheet] WARNING: headerRow ${header.headerRow} is out of range! Total rows: ${sheet.rows.length}`);
+  }
+
   for (const mapping of columnMappings) {
     if (mapping.isStatic) continue; // 静态值不参与列映射
     let colIndex = findColumnIndex(sheet, header.headerRow, mapping.sourceField);
+    console.log(`[parseSheet] Mapping "${mapping.sourceField}" → "${mapping.targetField}" = col ${colIndex}`);
     if (colIndex < 0) {
       // Try numeric index
       const num = parseInt(mapping.sourceField);
       if (!isNaN(num)) colIndex = num;
     }
     fieldMap.set(mapping.targetField, { colIndex, mapping });
+  }
+
+  // If no columns matched at all, log warning
+  const matchedCols = [...fieldMap.values()].filter(f => f.colIndex >= 0).length;
+  if (matchedCols === 0 && columnMappings.length > 0) {
+    console.warn(`[parseSheet] ZERO columns matched! Rule expects:`, columnMappings.map(m => m.sourceField), "Headers:", hdrRow?.slice(0, 15));
   }
 
   // Process data rows
@@ -588,6 +624,24 @@ function splitPdfOrders(rule: ParseRule, fileText: string, rawFile: RawFile): Pa
 // ===== 主执行入口 =====
 export async function executeRule(rule: ParseRule, rawFile: RawFile): Promise<ParsedOrder[]> {
   let orders: ParsedOrder[] = [];
+
+  console.log("[executeRule] Starting:", {
+    ruleName: rule.name,
+    fileType: rawFile.fileType,
+    sheets: rawFile.sheets.length,
+    sheetNames: rawFile.sheets.map(s => s.name),
+    firstSheetRows: rawFile.sheets[0]?.rows.length,
+    firstSheetCols: rawFile.sheets[0]?.maxCol,
+    hasCardBoundary: !!rule.cardBoundary?.enabled,
+    hasMultiSheet: !!rule.multiSheet?.enabled,
+    hasMatrixTranspose: !!rule.matrixTranspose?.enabled,
+    hasAggregation: !!rule.aggregation?.enabled,
+    hasFooterExtraction: !!rule.footerExtraction?.enabled,
+    hasTextParse: !!rule.textParse?.enabled,
+    hasPdfMultiOrder: !!rule.pdfConfig?.multiOrder,
+    columnMappings: rule.columnMappings.map(m => `${m.sourceField}→${m.targetField}`),
+    headerRow: rule.header?.headerRow,
+  });
 
   // PDF 多订单切分（优先处理）
   if (rule.pdfConfig?.multiOrder && rawFile.fileType === "pdf") {

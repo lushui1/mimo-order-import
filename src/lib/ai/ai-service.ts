@@ -34,23 +34,29 @@ export async function analyzeFileAndGenerateRule(
           {
             role: "system",
             content: `你是一个物流出库单解析规则生成专家。你需要分析用户提供的文件内容，生成一份解析规则配置（JSON格式）。
-规则用于将各种格式的文件（Excel/Word/PDF）解析为标准的运单数据。
+
+**重要：文件内容格式说明**
+每行格式为 "行N: 值1 | 值2 | 值3 | ..."，其中：
+- "行N: " 是行号标记，紧接的内容是用 " | " 分隔的各列值
+- sourceField 应使用列头中的**原始值**（去掉行号前缀后的纯净列名），不要包含 "行N: " 前缀
+- 例如：文本 "行3: 配送单号 | 收货机构 | 物品编码 | 物品名称 | 发货数量" → sourceField 取 "配送单号"、"收货机构"、"物品编码" 等
+
 你需要分析文件结构，识别：表头位置、列映射、尾部信息、跨行聚合、矩阵转置等。
 
-请只返回 JSON 格式的规则配置，不要包含其他说明文字。
-规则字段说明：
-- header.skipRows: 表头前跳过的行数
-- header.headerRow: 表头所在行号（0-based）
-- columnMappings: 列映射数组，每项包含 {sourceField: "源列名", targetField: "目标字段名", isStatic?: boolean, defaultValue?: string, isRequired?: boolean, transform?: "trim"|"toNumber", aiConfidence?: number}
-- targetField 可选值: 外部编码, 收货门店, 收件人姓名, 收件人电话, 收件人地址, SKU物品编码, SKU物品名称, SKU发货数量, SKU规格型号, 备注
-- footerExtraction: 尾部信息提取 {enabled: boolean, sections: [{startKeyword: string, fields: [{keyword, targetField, offset}]}]}
-- aggregation: 跨行聚合 {enabled: boolean, groupByField: string, sharedFields: string[]}
-- matrixTranspose: 矩阵转置 {enabled: boolean, dimensionColumns: number[], dimensionField: string, quantityField: string}
-- multiSheet: 多Sheet {enabled: boolean, extractStoreName: boolean}
-- cardBoundary: 卡片模式 {enabled: boolean, startPattern: string, dataStartOffset: number}
-- textParse: 纯文本解析(Word) {enabled: boolean, recordSeparator: string, fieldPatterns: [{name, targetField, pattern, extractGroup}]}
-- cellSplit: 复合单元格拆分 {enabled: boolean, columns: [{sourceColumn, separator, fieldMapping: [{index, targetField, pattern}]}]}
-- pdfConfig: PDF配置 {headerSkipLines, tableHeaderPattern, footerKeyword, multiOrder, orderSeparator}`,
+请只返回 JSON 格式的规则配置，不要包含其他说明文字。JSON 必须包含以下结构：
+{
+  "header": { "skipRows": 数字, "headerRow": 数字(0-based行号) },
+  "columnMappings": [{ "sourceField": "纯净列名", "targetField": "目标字段", "isRequired": true/false, "transform": "toNumber"(可选), "aiConfidence": 0.8 }],
+  "footerExtraction": { "enabled": true/false, "sections": [...] } 可选,
+  "aggregation": { "enabled": true/false, "groupByField": "列名", "sharedFields": [...] } 可选,
+  "matrixTranspose": { "enabled": true/false, "dimensionColumns": [列索引数组], "dimensionField": "收货门店", "quantityField": "SKU发货数量" } 可选,
+  "multiSheet": { "enabled": true/false, "extractStoreName": true/false } 可选,
+  "cardBoundary": { "enabled": true/false, "startPattern": "正则", "dataStartOffset": 数字 } 可选,
+  "textParse": { "enabled": true/false, "recordSeparator": "分隔符", "fieldPatterns": [] } 可选,
+  "cellSplit": { "enabled": true/false, "columns": [] } 可选,
+  "pdfConfig": { "headerSkipLines": 数字, "tableHeaderPattern": "模式", "footerKeyword": "关键词" } 可选
+}
+- targetField 可选值: 外部编码, 收货门店, 收件人姓名, 收件人电话, 收件人地址, SKU物品编码, SKU物品名称, SKU发货数量, SKU规格型号, 备注`,
           },
           { role: "user", content: prompt },
         ],
@@ -149,21 +155,27 @@ function localAnalyze(
 
   // ---- Excel 分析 ----
   // 检测表头行（查找包含"编码"或"名称"的行）
+  // 注意：rawFileToText 给每行加了"行N: "前缀，需要剥离
   let headerRowIdx = 0;
   for (let i = 0; i < Math.min(10, lines.length); i++) {
-    const line = lines[i].toLowerCase();
-    if (line.includes("编码") || line.includes("名称") || line.includes("数量")) {
+    // Strip "行N: " prefix added by rawFileToText
+    const cleanLine = lines[i].replace(/^行\d+:\s*/, "").toLowerCase();
+    if (cleanLine.includes("编码") || cleanLine.includes("名称") || cleanLine.includes("数量")) {
       headerRowIdx = i;
       break;
     }
   }
   rule.header = { skipRows: headerRowIdx, headerRow: headerRowIdx };
 
-  // 分析表头列
-  const headerLine = lines[headerRowIdx] || "";
-  const columns = headerLine.split(/[\t,|]/).map((c) => c.trim()).filter(Boolean);
+  // 分析表头列（剥离"行N: "前缀后再按 | 拆分）
+  const headerLine = (lines[headerRowIdx] || "").replace(/^行\d+:\s*/, "");
+  const columns = headerLine.split(/\s*\|\s*/).map((c) => c.trim()).filter(Boolean);
 
-  // 自动映射列
+  if (columns.length === 0) {
+    console.warn("localAnalyze: Could not extract columns from header line:", headerLine);
+  }
+
+  // 自动映射列（使用剥离前缀后的纯净列名）
   const mappings: any[] = [];
   columns.forEach((col) => {
     const cl = col.toLowerCase().replace(/[*\s]/g, "");
@@ -175,7 +187,7 @@ function localAnalyze(
       mappings.push({ sourceField: col, targetField: "SKU物品编码", isRequired: true, aiConfidence: 0.8 });
     } else if (cl.includes("物品名称") || cl.includes("sku名称") || cl === "名称") {
       mappings.push({ sourceField: col, targetField: "SKU物品名称", isRequired: true, aiConfidence: 0.8 });
-    } else if (cl.includes("数量") || cl.includes("发货")) {
+    } else if (cl.includes("数量") || cl.includes("发货") || cl.includes("出库")) {
       mappings.push({ sourceField: col, targetField: "SKU发货数量", isRequired: true, transform: "toNumber", aiConfidence: 0.8 });
     } else if (cl.includes("规格") || cl.includes("型号")) {
       mappings.push({ sourceField: col, targetField: "SKU规格型号", aiConfidence: 0.7 });
@@ -207,7 +219,11 @@ function localAnalyze(
   }
 
   // 检测是否有尾部收货信息（在数据区之后）
-  const dataEndIdx = lines.findIndex((l, i) => i > headerRowIdx + 2 && (l.includes("合计") || l.includes("总计")));
+  // 注意剥离"行N: "前缀
+  const dataEndIdx = lines.findIndex((l, i) =>
+    i > headerRowIdx + 2 &&
+    (l.replace(/^行\d+:\s*/, "").includes("合计") || l.replace(/^行\d+:\s*/, "").includes("总计"))
+  );
   if (dataEndIdx > 0) {
     const footerLines = lines.slice(dataEndIdx);
     const hasFooterReceiver = footerLines.some((l) => l.includes("收货人") || l.includes("收件人"));
@@ -242,6 +258,11 @@ function localAnalyze(
       quantityField: "SKU发货数量",
       excludeEmpty: true,
     };
+  }
+
+  // 检测是否为多Sheet（文件名包含"多门店"或"分Sheet"）
+  if (fileName.includes("多门店") || fileName.includes("分Sheet") || fileName.includes("Sheet")) {
+    rule.multiSheet = { enabled: true, extractStoreName: true };
   }
 
   rule.columnMappings = mappings;
