@@ -79,7 +79,7 @@ export default function UploadPage() {
     setProgress({ current: 10, total: 100, text: "AI 正在分析文件结构..." });
 
     try {
-      const fileText = rawFileToText(rawFile, 60);
+      const fileText = rawFileToText(rawFile, 40); // 减少到40行加速AI分析
       // 通过服务端 API 调用 AI，避免暴露 API Key
       const response = await fetch("/api/ai/analyze", {
         method: "POST",

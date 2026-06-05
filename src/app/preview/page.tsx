@@ -21,8 +21,8 @@ const TARGET_FIELDS = [
   { key: "备注", label: "备注" },
 ];
 
-const ROW_HEIGHT = 36;
-const HEADER_HEIGHT = 40;
+const ROW_HEIGHT = 44;
+const HEADER_HEIGHT = 42;
 
 // 提交结果类型
 interface SubmitResult {
@@ -141,6 +141,19 @@ export default function PreviewPage() {
     }]);
   }, []);
 
+  // 分页（替代有问题的虚拟滚动）
+  const [page, setPage] = useState(0);
+  const PAGE_SIZE = 50;
+  const totalPages = Math.ceil(orders.length / PAGE_SIZE);
+  const pagedOrders = orders.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
+  useEffect(() => {
+    // Reset page when orders change drastically
+    if (page >= totalPages && totalPages > 0) {
+      setPage(Math.max(0, totalPages - 1));
+    }
+  }, [orders.length, totalPages, page]);
+
   // 提交下单 - 调用 API 写入数据库
   const handleSubmit = useCallback(async () => {
     if (errors.length > 0) {
@@ -248,8 +261,6 @@ export default function PreviewPage() {
   const visibleCount = Math.ceil(containerHeight / ROW_HEIGHT) + 5;
   const startIdx = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - 5);
   const endIdx = Math.min(orders.length, startIdx + visibleCount);
-  const visibleOrders = orders.slice(startIdx, endIdx);
-  const totalHeight = orders.length * ROW_HEIGHT;
 
   const hasAnyError = errors.length > 0;
 
@@ -408,22 +419,20 @@ export default function PreviewPage() {
 
       {/* Data Table */}
       <div className="card" style={{ overflow: "hidden" }}>
-        <div className="table-wrapper" ref={tableRef} onScroll={() => {
-          if (tableRef.current) setScrollTop(tableRef.current.scrollTop);
-        }}>
-          <table className="data-table" style={{ position: "relative" }}>
+        <div className="table-wrapper" ref={tableRef} style={{ maxHeight: 70 * ROW_HEIGHT }}>
+          <table className="data-table">
             <thead>
               <tr style={{ height: HEADER_HEIGHT }}>
-                <th style={{ width: 40, position: "sticky", left: 0, zIndex: 11, background: "#f8fafc" }}>#</th>
-                <th style={{ width: 60, position: "sticky", left: 40, zIndex: 11, background: "#f8fafc" }}>操作</th>
+                <th style={{ width: 44, position: "sticky", left: 0, zIndex: 11, background: "#f8fafc" }}>#</th>
+                <th style={{ width: 56, position: "sticky", left: 44, zIndex: 11, background: "#f8fafc" }}></th>
                 {TARGET_FIELDS.map((f) => (
                   <th key={f.key} style={{ minWidth: 120 }}>{f.label}</th>
                 ))}
               </tr>
             </thead>
-            <tbody style={{ height: totalHeight }}>
-              {visibleOrders.map((order, visIdx) => {
-                const realIdx = startIdx + visIdx;
+            <tbody>
+              {pagedOrders.map((order, visIdx) => {
+                const realIdx = page * PAGE_SIZE + visIdx;
                 const isDuplicate = duplicates.has(realIdx);
                 const rowErrors = errors.filter((e) => e.rowIndex === realIdx);
 
@@ -431,18 +440,14 @@ export default function PreviewPage() {
                   <tr
                     key={realIdx}
                     style={{
-                      position: "absolute",
-                      top: startIdx * ROW_HEIGHT + visIdx * ROW_HEIGHT,
                       height: ROW_HEIGHT,
-                      left: 0,
-                      right: 0,
                       background: realIdx % 2 === 0 ? "white" : "#fafbfc",
                     }}
                   >
-                    <td style={{ width: 40, position: "sticky", left: 0, zIndex: 1, background: "inherit", fontSize: 12, color: "var(--text-secondary)", textAlign: "center" }}>
+                    <td style={{ width: 44, position: "sticky", left: 0, zIndex: 1, background: "inherit", fontSize: 12, color: "var(--text-secondary)", textAlign: "center" }}>
                       {realIdx + 1}
                     </td>
-                    <td style={{ width: 60, position: "sticky", left: 40, zIndex: 1, background: "inherit" }}>
+                    <td style={{ width: 56, position: "sticky", left: 44, zIndex: 1, background: "inherit" }}>
                       <button className="btn btn-ghost btn-sm" style={{ color: "var(--error)", fontSize: 11 }} onClick={() => deleteRow(realIdx)}>
                         ✕
                       </button>
@@ -458,7 +463,7 @@ export default function PreviewPage() {
                           key={f.key}
                           className={`editable ${isEditing ? "editing" : ""} ${cellErrors.length > 0 ? "error" : ""} ${isDuplicate && (f.key === "外部编码") ? "duplicate" : ""}`}
                           data-error={cellErrors.map((e) => e.message).join("; ")}
-                          style={{ minWidth: 120, position: "relative", background: isEditing ? undefined : undefined }}
+                          style={{ minWidth: 120 }}
                           onClick={() => {
                             if (!isEditing) setEditingCell({ row: realIdx, field: f.key });
                           }}
@@ -498,6 +503,22 @@ export default function PreviewPage() {
             </tbody>
           </table>
         </div>
+        {/* 分页控件 */}
+        {totalPages > 1 && (
+          <div style={{
+            display: "flex", justifyContent: "center", alignItems: "center",
+            gap: 8, padding: "10px 16px", borderTop: "1px solid var(--border)",
+            background: "#f8fafc", fontSize: 13
+          }}>
+            <button className="btn btn-ghost btn-sm" disabled={page === 0} onClick={() => setPage(0)}>««</button>
+            <button className="btn btn-ghost btn-sm" disabled={page === 0} onClick={() => setPage(p => p - 1)}>‹</button>
+            <span style={{ color: "var(--text-secondary)" }}>
+              第 {page + 1} / {totalPages} 页 · 共 {orders.length} 条
+            </span>
+            <button className="btn btn-ghost btn-sm" disabled={page >= totalPages - 1} onClick={() => setPage(p => p + 1)}>›</button>
+            <button className="btn btn-ghost btn-sm" disabled={page >= totalPages - 1} onClick={() => setPage(totalPages - 1)}>»»</button>
+          </div>
+        )}
       </div>
     </div>
   );

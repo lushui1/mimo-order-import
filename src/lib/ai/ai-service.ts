@@ -17,11 +17,20 @@ export async function analyzeFileAndGenerateRule(
 ): Promise<Partial<ParseRule>> {
   // If no API key configured, use local heuristic analysis
   if (!API_KEY) {
+    console.log("[AI] No API key, using local analysis");
     return localAnalyze(fileContent, fileName, fileType);
   }
 
   try {
     const prompt = buildAnalysisPrompt(fileContent, fileName, fileType);
+    
+    console.log(`[AI] Calling ${AI_MODEL} at ${API_BASE}...`);
+    const startTime = Date.now();
+    
+    // 15秒超时保护
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    
     const response = await fetch(`${API_BASE}/chat/completions`, {
       method: "POST",
       headers: {
@@ -33,37 +42,32 @@ export async function analyzeFileAndGenerateRule(
         messages: [
           {
             role: "system",
-            content: `你是一个物流出库单解析规则生成专家。你需要分析用户提供的文件内容，生成一份解析规则配置（JSON格式）。
+            content: `你是物流出库单解析专家。根据文件内容生成JSON规则配置。
 
-**重要：文件内容格式说明**
-每行格式为 "行N: 值1 | 值2 | 值3 | ..."，其中：
-- "行N: " 是行号标记，紧接的内容是用 " | " 分隔的各列值
-- sourceField 应使用列头中的**原始值**（去掉行号前缀后的纯净列名），不要包含 "行N: " 前缀
-- 例如：文本 "行3: 配送单号 | 收货机构 | 物品编码 | 物品名称 | 发货数量" → sourceField 取 "配送单号"、"收货机构"、"物品编码" 等
+文件格式: 每行 "行N: 值1 | 值2 | 值3 | ..."
+sourceField 取纯净列名（不含"行N: "前缀）
 
-你需要分析文件结构，识别：表头位置、列映射、尾部信息、跨行聚合、矩阵转置等。
+返回JSON结构:
+{"header":{"skipRows":数字,"headerRow":数字},"columnMappings":[{"sourceField":"列名","targetField":"目标","isRequired":bool,"transform":"toNumber"(可选),"aiConfidence":0.8}]}
 
-请只返回 JSON 格式的规则配置，不要包含其他说明文字。JSON 必须包含以下结构：
-{
-  "header": { "skipRows": 数字, "headerRow": 数字(0-based行号) },
-  "columnMappings": [{ "sourceField": "纯净列名", "targetField": "目标字段", "isRequired": true/false, "transform": "toNumber"(可选), "aiConfidence": 0.8 }],
-  "footerExtraction": { "enabled": true/false, "sections": [...] } 可选,
-  "aggregation": { "enabled": true/false, "groupByField": "列名", "sharedFields": [...] } 可选,
-  "matrixTranspose": { "enabled": true/false, "dimensionColumns": [列索引数组], "dimensionField": "收货门店", "quantityField": "SKU发货数量" } 可选,
-  "multiSheet": { "enabled": true/false, "extractStoreName": true/false } 可选,
-  "cardBoundary": { "enabled": true/false, "startPattern": "正则", "dataStartOffset": 数字 } 可选,
-  "textParse": { "enabled": true/false, "recordSeparator": "分隔符", "fieldPatterns": [] } 可选,
-  "cellSplit": { "enabled": true/false, "columns": [] } 可选,
-  "pdfConfig": { "headerSkipLines": 数字, "tableHeaderPattern": "模式", "footerKeyword": "关键词" } 可选
-}
-- targetField 可选值: 外部编码, 收货门店, 收件人姓名, 收件人电话, 收件人地址, SKU物品编码, SKU物品名称, SKU发货数量, SKU规格型号, 备注`,
+可选targetField: 外部编码,收货门店,收件人姓名,收件人电话,收件人地址,SKU物品编码,SKU物品名称,SKU发货数量,SKU规格型号,备注
+
+补充检测(可选): footerExtraction(尾部信息), aggregation(跨行聚合), matrixTranspose(矩阵转置), multiSheet(多Sheet), cardBoundary(卡片式), pdfConfig(PDF配置)
+
+只返回JSON，无其他文字。`,
           },
           { role: "user", content: prompt },
         ],
         temperature: 0.1,
-        max_tokens: 4000,
+        max_tokens: 2000,
       }),
+      signal: controller.signal,
     });
+    
+    clearTimeout(timeoutId);
+    
+    const elapsed = Date.now() - startTime;
+    console.log(`[AI] Response in ${elapsed}ms, status=${response.status}`);
 
     if (!response.ok) throw new Error(`API Error: ${response.status}`);
 
@@ -76,8 +80,8 @@ export async function analyzeFileAndGenerateRule(
       return JSON.parse(jsonMatch[0]);
     }
     throw new Error("No valid JSON in response");
-  } catch (error) {
-    console.error("AI service error, falling back to local analysis:", error);
+  } catch (error: any) {
+    console.error("AI service error, falling back to local analysis:", error.message);
     return localAnalyze(fileContent, fileName, fileType);
   }
 }
@@ -289,30 +293,15 @@ function detectSeparator(lines: string[]): string {
   return "---";
 }
 
-// ===== 构建 AI Prompt =====
+// ===== 构建 AI Prompt（精简版，加速响应）=====
 function buildAnalysisPrompt(
   fileContent: string,
   fileName: string,
   fileType: string
 ): string {
-  return `请分析以下文件内容，生成解析规则。
+  return `文件名: ${fileName} (${fileType})
+文件内容（前40行，格式: 行N: 列1 | 列2 | ...）:
+${fileContent.substring(0, 2000)}
 
-文件名: ${fileName}
-文件类型: ${fileType}
-
-文件内容（前60行）:
-${fileContent.substring(0, 3000)}
-
-请特别注意：
-1. 识别表头在哪一行（0-based）
-2. 哪些列包含 SKU物品编码、SKU物品名称、SKU发货数量
-3. 是否有收货人/电话/地址信息在数据区底部或尾部
-4. 是否需要跨行聚合（同单号多行共享收货信息）
-5. 是否有门店作为列头需要转置
-6. 是否有多个Sheet需要合并
-7. 是否为卡片式布局
-8. 如果是PDF，注意底部是否有收货人信息
-9. 如果是Word，注意是否有分隔线和文本格式的记录
-
-请生成完整的规则 JSON。`;
+请返回JSON规则，识别: 表头行号、列映射(SKU编码/名称/数量=必填)、尾部收货信息、跨行聚合、矩阵转置、多Sheet。`;
 }
