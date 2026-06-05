@@ -7,10 +7,16 @@ let pgPool: Pool | null = null;
 let dbError: string | null = null;
 
 function getConnStr(): string {
-  return (process.env.DATABASE_URL ||
-          process.env.POSTGRES_URL ||
-          process.env.POSTGRES_URL_NON_POOLING ||
-          "").replace(/[?&]channel_binding=require/g, "");
+  let conn = (process.env.DATABASE_URL ||
+              process.env.POSTGRES_URL ||
+              process.env.POSTGRES_URL_NON_POOLING ||
+              "");
+  // 清理 Neon 特有参数，pg 模块不支持
+  conn = conn.replace(/[?&]channel_binding=require/g, "");
+  // 修复清理后可能残留的 ?& 或末尾 ?
+  conn = conn.replace(/\?&/, "?").replace(/\?$/, "");
+  console.log("[DB] Connection string (sanitized):", conn.replace(/\/\/.*@/, "//***@"));
+  return conn;
 }
 
 async function getPgClient() {
