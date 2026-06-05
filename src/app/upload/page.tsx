@@ -2,14 +2,14 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { getRules, saveRule, generateId, setCurrentOrders, getCurrentOrders } from "@/lib/store";
+import { getRules, saveRule, generateId, setCurrentOrders, getCurrentOrders, syncRulesFromServer } from "@/lib/store";
 import { parseFile, rawFileToText } from "@/lib/rule-engine/file-parser";
 import { executeRule } from "@/lib/rule-engine/rule-executor";
 import { getDefaultRules } from "@/lib/rule-engine/presets";
 import type { ParseRule, RawFile, ParsedOrder, ColumnMapping } from "@/lib/types";
 import { useToast } from "@/components/ToastProvider";
 
-type Step = "upload" | "rule-select" | "ai-analyze" | "rule-edit" | "parsing" | "done";
+type Step = "upload" | "rule-select" | "ai-analyze" | "parsing" | "done";
 
 export default function UploadPage() {
   const [step, setStep] = useState<Step>("upload");
@@ -25,16 +25,19 @@ export default function UploadPage() {
   const router = useRouter();
   const toast = useToast();
 
-  const refreshRules = useCallback(() => {
+  const refreshRules = useCallback(async () => {
     const saved = getRules();
     if (saved.length === 0) {
       const presets = getDefaultRules();
       presets.forEach((r) => saveRule(r));
-      setRules(getRules());
+      const fresh = getRules();
+      setRules(fresh);
     } else {
-      setRules(saved);
+      // 同步服务端规则并合并
+      const merged = await syncRulesFromServer(saved);
+      setRules(merged);
     }
-  }, [toast]);
+  }, []);
 
   // Auto-load presets if no rules exist
   useEffect(() => {
@@ -62,11 +65,14 @@ export default function UploadPage() {
       setRawFile(parsed);
       setProgress({ current: 50, total: 100, text: `文件读取完成 (${parsed.sheets[0]?.rows.length || 0}行)` });
 
-      // Load rules and go to rule selection
-      refreshRules();
+      // 手动选择规则 — 不做自动匹配
+      await refreshRules();
+      const freshRules = getRules();
+      setRules(freshRules);
+      setSelectedRule(null);
       setStep("rule-select");
-      setProgress({ current: 100, total: 100, text: "就绪" });
-      toast.showToast(`已读取: ${f.name}`, "success");
+      setProgress({ current: 100, total: 100, text: "就绪 — 请选择或创建解析规则" });
+      toast.showToast(`已读取: ${f.name}，请选择解析规则或新建`, "success");
     } catch (err: any) {
       console.error("Parse error:", err);
       toast.showToast(`文件读取失败: ${err.message}`, "error");
@@ -95,10 +101,24 @@ export default function UploadPage() {
         throw new Error(errData.error || `AI 分析失败 (${response.status})`);
       }
       const data = await response.json();
-      setAiRule(data.rule);
+      const rule = data.rule;
+
+      // 安全检查：如果规则没有列映射，说明分析失败
+      if (!rule.columnMappings || rule.columnMappings.length === 0) {
+        throw new Error("AI 未生成有效的列映射，请尝试手动创建规则");
+      }
+
+      setAiRule(rule);
       setShowAiResult(true);
-      setProgress({ current: 100, total: 100, text: "AI 分析完成" });
-      toast.showToast("AI 已生成推荐规则，请确认", "info");
+
+      // 如果是 fallback 规则，提示用户
+      if ((rule as any)._fallback) {
+        setProgress({ current: 100, total: 100, text: "本地分析完成（AI 未返回有效规则）" });
+        toast.showToast(`AI 分析未返回有效规则，已使用本地启发式分析替代`, "info");
+      } else {
+        setProgress({ current: 100, total: 100, text: "AI 分析完成" });
+        toast.showToast("AI 已生成推荐规则，请确认", "info");
+      }
     } catch (err: any) {
       toast.showToast(`AI 分析失败: ${err.message}`, "error");
       setStep("rule-select");
@@ -107,10 +127,20 @@ export default function UploadPage() {
 
   const confirmAiRule = () => {
     if (!aiRule) return;
+
+    // 安全检查：拒绝保存空的列映射
+    if (!aiRule.columnMappings || aiRule.columnMappings.length === 0) {
+      toast.showToast("规则列映射为空，无法保存。请重新进行 AI 分析或手动创建规则", "error");
+      return;
+    }
+
+    const isFallback = (aiRule as any)._fallback;
     const newRule: ParseRule = {
       id: generateId(),
       name: `${file?.name?.split(".")[0] || "新规则"} - AI生成规则`,
-      description: `AI 自动生成 · 基于 ${file?.name || "未知文件"}`,
+      description: isFallback
+        ? `本地启发式分析 · 基于 ${file?.name || "未知文件"}（AI 未返回有效规则）`
+        : `AI 自动生成 · 基于 ${file?.name || "未知文件"}`,
       fileType: rawFile?.fileType || "excel",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -135,7 +165,7 @@ export default function UploadPage() {
     setSelectedRule(newRule);
     setShowAiResult(false);
     refreshRules();
-    toast.showToast("AI 规则已保存并选中", "success");
+    toast.showToast(isFallback ? "本地分析规则已保存并选中" : "AI 规则已保存并选中", "success");
     setStep("rule-select");
   };
 
@@ -147,9 +177,14 @@ export default function UploadPage() {
     try {
       const orders = await executeRule(selectedRule, rawFile);
       console.log("ExecuteRule result:", orders.length, "orders, first:", orders[0]);
-      
+
       if (orders.length === 0) {
-        toast.showToast("解析结果为空，请检查规则配置是否匹配文件格式", "error");
+        const ruleMappings = selectedRule.columnMappings?.length || 0;
+        const ruleHeaderRow = selectedRule.header?.headerRow ?? 0;
+        const hint = ruleMappings === 0
+          ? "规则列映射为空，请删除此规则后重新进行 AI 分析"
+          : `解析结果为空（规则映射 ${ruleMappings} 列，表头行 ${ruleHeaderRow}），请检查：① 表头行号是否正确 ② 列名是否与文件匹配 ③ 尝试重新 AI 分析`;
+        toast.showToast(hint, "error");
         setStep("rule-select");
         return;
       }
@@ -164,6 +199,37 @@ export default function UploadPage() {
       
       setProgress({ current: 100, total: 100, text: `就绪 - ${orders.length} 条运单` });
       
+      toast.showToast(`解析完成，共 ${orders.length} 条运单`, "success");
+      setStep("done");
+    } catch (err: any) {
+      console.error("Parse error:", err);
+      toast.showToast(`解析失败: ${err.message}`, "error");
+      setStep("rule-select");
+    }
+  };
+
+  // 直接传入 rule 执行解析（供自动匹配后调用，避免 state 异步问题）
+  const executeParsingWithRule = async (rule: ParseRule, rf: RawFile) => {
+    if (!rf || !rule) return;
+    setStep("parsing");
+    setProgress({ current: 10, total: 100, text: "正在执行解析..." });
+
+    try {
+      const orders = await executeRule(rule, rf);
+      console.log("executeParsingWithRule result:", orders.length, "orders");
+
+      if (orders.length === 0) {
+        toast.showToast("解析结果为空，请检查规则配置是否匹配文件格式", "error");
+        setStep("rule-select");
+        return;
+      }
+
+      setProgress({ current: 80, total: 100, text: `解析完成，共 ${orders.length} 条记录` });
+      setCurrentOrders(orders);
+      const saved = getCurrentOrders();
+      console.log("Saved orders count:", saved.length);
+
+      setProgress({ current: 100, total: 100, text: `就绪 - ${orders.length} 条运单` });
       toast.showToast(`解析完成，共 ${orders.length} 条运单`, "success");
       setStep("done");
     } catch (err: any) {
@@ -325,13 +391,22 @@ export default function UploadPage() {
         <div className="modal-overlay">
           <div className="modal-content" style={{ maxWidth: 600 }}>
             <div className="modal-header">
-              <h3 style={{ fontSize: 16, fontWeight: 600 }}>🤖 AI 推荐解析规则</h3>
+              <h3 style={{ fontSize: 16, fontWeight: 600 }}>
+                {(aiRule as any)._fallback ? "⚠️ 本地启发式分析规则" : "🤖 AI 推荐解析规则"}
+              </h3>
               <button className="btn btn-ghost btn-sm" onClick={() => { setShowAiResult(false); setStep("rule-select"); }}>✕</button>
             </div>
             <div className="modal-body">
-              <p style={{ fontSize: 13, color: "var(--text-secondary)", marginBottom: 16 }}>
-                AI 已分析文件结构并生成推荐规则，请确认后保存。标注"推测"的映射建议重点关注。
-              </p>
+              {(aiRule as any)._fallback ? (
+                <div style={{ padding: "10px 14px", background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8, marginBottom: 16, fontSize: 13, color: "#92400e" }}>
+                  <strong>⚠️ {(aiRule as any)._fallbackReason || "AI 未返回有效规则"}</strong>
+                  <br />已使用本地启发式分析自动识别文件结构，建议核对列映射是否准确。
+                </div>
+              ) : (
+                <p style={{ fontSize: 13, color: "var(--text-secondary)", marginBottom: 16 }}>
+                  AI 已分析文件结构并生成推荐规则，请确认后保存。标注"推测"的映射建议重点关注。
+                </p>
+              )}
 
               {/* Header Config */}
               <div style={{ marginBottom: 16 }}>

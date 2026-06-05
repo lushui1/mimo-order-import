@@ -5,14 +5,119 @@
 import type { ParseRule, ParsedOrder } from "./types";
 import type { RawFile, RawSheet } from "./file-parser";
 
-// ----- 从规则获取源列索引（精确匹配 + 模糊兜底）-----
-function findColumnIndex(sheet: RawSheet, headerRow: number, fieldName: string): number {
+// 常见字段的同义词映射（用于增强模糊匹配）
+const FIELD_SYNONYMS: Record<string, string[]> = {
+  "SKU物品编码": ["编码", "物品编码", "SKU编码", "产品编码", "货号", "物料编码", "商品编码"],
+  "SKU物品名称": ["名称", "物品名称", "SKU名称", "产品名称", "品名", "商品名称"],
+  "SKU发货数量": ["数量", "发货数量", "出库数量", "需求数量", "件数"],
+  "SKU规格型号": ["规格", "规格型号", "型号", "尺寸", "参数"],
+  "收件人姓名": ["收货人", "收件人", "联系人", "接收人", "客户"],
+  "收件人电话": ["电话", "手机", "联系电话", "手机号码", "联系方式"],
+  "收件人地址": ["地址", "收货地址", "配送地址", "邮寄地址"],
+  "收货门店": ["门店", "店铺", "仓库", "机构", "网点", "站点"],
+  "外部编码": ["配送单号", "外部编码", "订单号", "单号", "运单号", "出库单号", "批次号"],
+  "备注": ["备注", "说明", "备注信息", "摘要"],
+};
+
+// 规范化字符串：去掉 *、空格、特殊字符，转小写
+function normalizeStr(s: string | null | undefined): string {
+  if (!s) return "";
+  return String(s).replace(/[*\s·・`~!@#$%^&*()_+=\[\]{};:'",.<>?/\\|\-]/g, "").toLowerCase();
+}
+
+// ----- 自动检测表头行（基于关键词密度评分）-----
+function autoDetectHeaderRow(sheet: RawSheet): number {
+  const keywords = ["编码", "名称", "数量", "规格", "门店", "地址", "SKU", "物品", "收货",
+                     "单号", "电话", "配送", "联系人", "备注", "型号"];
+  let bestRow = 0;
+  let bestScore = -1;
+
+  for (let i = 0; i < Math.min(20, sheet.rows.length); i++) {
+    const row = sheet.rows[i];
+    if (!row) continue;
+    // 计算关键词命中密度：每个命中+1，行长度(列数)归一化
+    let score = 0;
+    let nonEmptyCols = 0;
+    for (let c = 0; c < row.length; c++) {
+      const val = row[c];
+      if (val === null || val === "") continue;
+      nonEmptyCols++;
+      const strVal = String(val).toLowerCase();
+      for (const kw of keywords) {
+        if (strVal.includes(kw.toLowerCase())) {
+          score++;
+          break; // 每列最多计数一次
+        }
+      }
+    }
+    // 密度分 = 命中列数 / 非空列数（避免全是空列的行得分高）
+    const density = nonEmptyCols > 0 ? score / Math.max(1, nonEmptyCols) : 0;
+    // 额外加分：含有"编码"或"名称"关键词 +2
+    const rowStr = row.map(c => (c === null ? "" : String(c))).join("").toLowerCase();
+    if (rowStr.includes("编码") || rowStr.includes("名称")) score += 2;
+
+    if (density > bestScore || (density === bestScore && score > 0)) {
+      bestScore = density;
+      bestRow = i;
+    }
+  }
+
+  // 如果没找到足够好的表头（密度 < 0.15），返回0
+  if (bestScore < 0.15 && bestRow > 0) {
+    console.log(`[autoDetectHeaderRow] Low confidence (score=${bestScore.toFixed(2)}), returning row ${bestRow} anyway`);
+  }
+  console.log(`[autoDetectHeaderRow] Best header at row ${bestRow} (density=${bestScore?.toFixed(2)})`);
+  return bestRow;
+}
+
+// 在 headerRow 附近 ±range 行内扫描最佳匹配
+function scanHeaderRows(
+  sheet: RawSheet,
+  centerRow: number,
+  columnMappings: ParseRule["columnMappings"],
+  range: number = 3
+): { row: number; fieldMap: Map<string, { colIndex: number; mapping: ParseRule["columnMappings"][0] }>; matched: number } {
+  const startRow = Math.max(0, centerRow - range);
+  const endRow = Math.min(sheet.rows.length - 1, centerRow + range);
+  let bestResult = { row: centerRow, fieldMap: new Map() as Map<string, any>, matched: 0 };
+
+  for (let r = startRow; r <= endRow; r++) {
+    const fm = new Map<string, { colIndex: number; mapping: ParseRule["columnMappings"][0] }>();
+    const matched = buildFieldMap(sheet, r, columnMappings, fm);
+    if (matched > bestResult.matched) {
+      bestResult = { row: r, fieldMap: fm, matched };
+    }
+    if (matched === columnMappings.filter(m => !m.isStatic).length) break; // 全部匹配，不再继续
+  }
+
+  return bestResult;
+}
+
+// ----- 从规则获取源列索引（精确匹配 + 规范化匹配 + 模糊兜底 + 同义词匹配）-----
+function findColumnIndex(sheet: RawSheet, headerRow: number, fieldName: string, targetField?: string): number {
   const row = sheet.rows[headerRow];
   if (!row) return -1;
+
+  const normalizedField = normalizeStr(fieldName);
 
   // Step 1: Exact match (trimmed)
   for (let c = 0; c < row.length; c++) {
     if (row[c] !== null && String(row[c]).trim() === fieldName) return c;
+  }
+
+  // Step 1.5: Normalized match (strip special chars, case-insensitive)
+  // 处理 AI 返回 "物品编码*" vs 实际列头 "物品编码" 或 "物品 编码" 等差异
+  if (normalizedField.length >= 2) {
+    for (let c = 0; c < row.length; c++) {
+      const val = row[c];
+      if (val !== null) {
+        const cellNorm = normalizeStr(String(val));
+        if (cellNorm === normalizedField) {
+          console.log(`[findColumnIndex] Normalized match: "${fieldName}" ↔ "${String(val).trim()}" at col ${c}`);
+          return c;
+        }
+      }
+    }
   }
 
   // Step 2: Fuzzy match (contains)
@@ -23,11 +128,27 @@ function findColumnIndex(sheet: RawSheet, headerRow: number, fieldName: string):
   }
 
   // Step 3: Reverse fuzzy (header contains fieldName keyword)
-  const keywords = fieldName.replace(/[*\s]/g, "");
-  if (keywords.length >= 2) {
+  if (normalizedField.length >= 2) {
     for (let c = 0; c < row.length; c++) {
-      const cell = row[c] !== null ? String(row[c]).trim().replace(/[*\s]/g, "") : "";
-      if (cell && keywords.includes(cell)) return c;
+      const val = row[c];
+      const cell = val !== null ? normalizeStr(String(val)) : "";
+      if (cell && (cell.includes(normalizedField) || normalizedField.includes(cell))) return c;
+    }
+  }
+
+  // Step 4: Synonym match (using targetField to lookup synonyms)
+  if (targetField) {
+    const synonyms = FIELD_SYNONYMS[targetField] || [];
+    for (const syn of synonyms) {
+      const normalizedSyn = normalizeStr(syn);
+      for (let c = 0; c < row.length; c++) {
+        const val2 = row[c];
+        const cell2 = val2 !== null ? normalizeStr(String(val2)) : "";
+        if (cell2 && (cell2.includes(normalizedSyn) || normalizedSyn.includes(cell2))) {
+          console.log(`[findColumnIndex] Synonym match: "${syn}" → column ${c} ("${row[c]}")`);
+          return c;
+        }
+      }
     }
   }
 
@@ -40,51 +161,84 @@ function findColumnIndexByNumber(sheet: RawSheet, colIndex: number): boolean {
 
 // ----- 解析单个 Sheet -----
 function parseSheet(rule: ParseRule, sheet: RawSheet, _sheetName: string): ParsedOrder[] {
-  const { header, columnMappings } = rule;
-  const dataStartRow = header.headerRow + 1;
+  let { header, columnMappings } = rule;
+  let headerRow = header.headerRow;
   const orders: ParsedOrder[] = [];
 
   // Build field → column index mapping
-  const fieldMap = new Map<string, { colIndex: number; mapping: typeof columnMappings[0] }>();
+  let fieldMap = new Map<string, { colIndex: number; mapping: typeof columnMappings[0] }>();
 
-  console.log(`[parseSheet] Sheet="${_sheetName}" headerRow=${header.headerRow} dataStartRow=${dataStartRow} totalRows=${sheet.rows.length}`);
-  
-  // Debug: show header row content
-  const hdrRow = sheet.rows[header.headerRow];
-  if (hdrRow) {
-    console.log(`[parseSheet] Header row (first 10 cols):`, hdrRow.slice(0, 10).map(c => c === null ? "NULL" : `"${String(c).trim()}"`));
-  } else {
-    console.log(`[parseSheet] WARNING: headerRow ${header.headerRow} is out of range! Total rows: ${sheet.rows.length}`);
-  }
+  console.log(`[parseSheet] Sheet="${_sheetName}" ruleHeaderRow=${headerRow} totalRows=${sheet.rows.length}`);
 
-  for (const mapping of columnMappings) {
-    if (mapping.isStatic) continue; // 静态值不参与列映射
-    let colIndex = findColumnIndex(sheet, header.headerRow, mapping.sourceField);
-    console.log(`[parseSheet] Mapping "${mapping.sourceField}" → "${mapping.targetField}" = col ${colIndex}`);
-    if (colIndex < 0) {
-      // Try numeric index
-      const num = parseInt(mapping.sourceField);
-      if (!isNaN(num)) colIndex = num;
+  // ==== 多层次表头检测：扫描规则指定的行 ±3 → 自动检测行 ±3 → 全表头候选行 ====
+  let matchedCols = 0;
+
+  // Level 1: 规则指定的 headerRow ±3 范围内扫描
+  if (columnMappings.length > 0) {
+    const scanResult = scanHeaderRows(sheet, headerRow, columnMappings, 3);
+    fieldMap = scanResult.fieldMap;
+    matchedCols = scanResult.matched;
+    if (scanResult.row !== headerRow && matchedCols > 0) {
+      headerRow = scanResult.row;
+      console.log(`[parseSheet] Level 1 scan: shifted headerRow ${header.headerRow}→${headerRow}, matched ${matchedCols}`);
     }
-    fieldMap.set(mapping.targetField, { colIndex, mapping });
   }
 
-  // If no columns matched at all, log warning
-  const matchedCols = [...fieldMap.values()].filter(f => f.colIndex >= 0).length;
+  // Level 2: 自动检测表头行（密度评分）→ 在其 ±3 范围内扫描
   if (matchedCols === 0 && columnMappings.length > 0) {
-    console.warn(`[parseSheet] ZERO columns matched! Rule expects:`, columnMappings.map(m => m.sourceField), "Headers:", hdrRow?.slice(0, 15));
+    console.warn(`[parseSheet] Level 1 failed (${matchedCols} cols at headerRow=${headerRow}), trying auto-detect...`);
+    const detected = autoDetectHeaderRow(sheet);
+    if (detected !== headerRow && detected < sheet.rows.length) {
+      const scanResult = scanHeaderRows(sheet, detected, columnMappings, 3);
+      if (scanResult.matched > 0) {
+        fieldMap = scanResult.fieldMap;
+        matchedCols = scanResult.matched;
+        headerRow = scanResult.row;
+        console.log(`[parseSheet] Level 2 auto-detect: headerRow=${headerRow}, matched ${matchedCols}`);
+      }
+    }
+  }
+
+  // Level 3: 全表头候选行遍历（前 15 行中匹配数最高的）
+  if (matchedCols === 0 && columnMappings.length > 0) {
+    console.warn(`[parseSheet] Level 2 failed, scanning all candidate header rows...`);
+    let bestAll = { row: 0, fieldMap: fieldMap, matched: 0 };
+    for (let r = 0; r < Math.min(15, sheet.rows.length); r++) {
+      const fm = new Map<string, { colIndex: number; mapping: typeof columnMappings[0] }>();
+      const m = buildFieldMap(sheet, r, columnMappings, fm);
+      if (m > bestAll.matched) {
+        bestAll = { row: r, fieldMap: fm, matched: m };
+        if (m === columnMappings.filter(mc => !mc.isStatic).length) break;
+      }
+    }
+    if (bestAll.matched > 0) {
+      fieldMap = bestAll.fieldMap;
+      matchedCols = bestAll.matched;
+      headerRow = bestAll.row;
+      console.log(`[parseSheet] Level 3 full scan: headerRow=${headerRow}, matched ${matchedCols}`);
+    }
+  }
+
+  if (matchedCols === 0 && columnMappings.length > 0) {
+    console.warn(`[parseSheet] CRITICAL: ZERO columns matched after all 3 levels!`);
+    console.warn(`[parseSheet] Rule expects:`, columnMappings.map(m => `${m.sourceField}→${m.targetField}`));
+    for (let r = 0; r < Math.min(10, sheet.rows.length); r++) {
+      const hdrRow = sheet.rows[r];
+      console.warn(`[parseSheet] Row ${r}:`, hdrRow?.slice(0, 15).map(c => c === null ? "NULL" : `"${String(c).substring(0, 20)}"`));
+    }
+  } else if (columnMappings.length > 0) {
+    console.log(`[parseSheet] Final: headerRow=${headerRow}, matched ${matchedCols}/${columnMappings.filter(m => !m.isStatic).length} columns`);
   }
 
   // Process data rows
-  for (let r = dataStartRow; r < sheet.rows.length; r++) {
+  for (let r = headerRow + 1; r < sheet.rows.length; r++) {
     const row = sheet.rows[r];
 
     // Skip empty rows
     if (!row || row.every((c) => c === null || c === "")) continue;
 
-    // Skip 合计/合计行
-    const firstCell = row[0] ? String(row[0]).trim() : "";
-    if (firstCell === "合计" || firstCell === "合" || firstCell === "总计") continue;
+    // Skip 合计/总计/汇总/小计行 — 扫描整行所有单元格
+    if (isSummaryRow(row)) continue;
 
     const order: ParsedOrder = {
       rowIndex: r,
@@ -118,7 +272,7 @@ function parseSheet(rule: ParseRule, sheet: RawSheet, _sheetName: string): Parse
       }
 
       let strVal = String(val).trim();
-      
+
       // Apply transform
       if (mapping.transform) {
         const transforms = mapping.transform.split("|");
@@ -147,12 +301,138 @@ function parseSheet(rule: ParseRule, sheet: RawSheet, _sheetName: string): Parse
     }
 
     // Skip if no SKU data
-    if (!order.SKU物品编码 && !order.SKU物品名称 && !order.SKU物品名称?.trim()) continue;
+    if (!order.SKU物品编码 && !order.SKU物品名称?.trim()) continue;
 
     orders.push(order);
   }
 
   return orders;
+}
+
+// Helper: build field map and return matched column count
+function buildFieldMap(
+  sheet: RawSheet,
+  headerRow: number,
+  columnMappings: ParseRule["columnMappings"],
+  fieldMap: Map<string, { colIndex: number; mapping: ParseRule["columnMappings"][0] }>
+): number {
+  const hdrRow = sheet.rows[headerRow];
+  if (hdrRow) {
+    console.log(`[buildFieldMap] Headers at row ${headerRow}:`, hdrRow.slice(0, 12).map(c => c === null ? "NULL" : `"${String(c).trim()}"`));
+  }
+
+  let matched = 0;
+  for (const mapping of columnMappings) {
+    if (mapping.isStatic) continue;
+
+    let colIndex = -1;
+
+    // Step A: SourceField 匹配（4级匹配：精确→模糊→反向→同义词）
+    if (mapping.sourceField && mapping.sourceField.trim()) {
+      colIndex = findColumnIndex(sheet, headerRow, mapping.sourceField, mapping.targetField);
+      console.log(`[buildFieldMap] sourceField="${mapping.sourceField}" → "${mapping.targetField}" = col ${colIndex}`);
+    }
+
+    // Step B: SourceField 为空或匹配失败 → 直接用 targetField 的同义词搜索列头
+    if (colIndex < 0) {
+      console.log(`[buildFieldMap] sourceField miss, falling back to targetField synonyms for "${mapping.targetField}"`);
+      colIndex = findColumnByTargetField(sheet, headerRow, mapping.targetField);
+      if (colIndex >= 0) {
+        console.log(`[buildFieldMap] targetField synonym match: "${mapping.targetField}" → col ${colIndex} ("${hdrRow?.[colIndex]}")`);
+      }
+    }
+
+    // Step C: sourceField 是数字 → 按列索引
+    if (colIndex < 0) {
+      const num = parseInt(mapping.sourceField || "");
+      if (!isNaN(num)) {
+        colIndex = num;
+        console.log(`[buildFieldMap] numeric sourceField "${mapping.sourceField}" → col ${colIndex}`);
+      }
+    }
+
+    if (colIndex >= 0) matched++;
+    fieldMap.set(mapping.targetField, { colIndex, mapping });
+  }
+  return matched;
+}
+
+// 直接用 targetField 和其同义词搜索列头（当 sourceField 不匹配时兜底）
+function findColumnByTargetField(sheet: RawSheet, headerRow: number, targetField: string): number {
+  const row = sheet.rows[headerRow];
+  if (!row) return -1;
+
+  const synonyms = FIELD_SYNONYMS[targetField] || [];
+
+  // 先尝试用 targetField 本身的规范化名称
+  const normalizedTarget = normalizeStr(targetField);
+  const searchTerms = [targetField, normalizedTarget, ...synonyms];
+
+  for (const term of searchTerms) {
+    if (!term) continue;
+    const nTerm = normalizeStr(term);
+    if (!nTerm || nTerm.length < 1) continue;
+
+    for (let c = 0; c < row.length; c++) {
+      const val = row[c];
+      if (val === null) continue;
+      const cellNormalized = normalizeStr(String(val));
+      if (!cellNormalized) continue;
+
+      // 精确匹配 / 包含匹配 / 反向包含
+      if (cellNormalized === nTerm ||
+          cellNormalized.includes(nTerm) ||
+          nTerm.includes(cellNormalized)) {
+        return c;
+      }
+    }
+  }
+
+  return -1;
+}
+
+// 检测一行是否为汇总/合计/统计行（非数据行）
+function isSummaryRow(row: (string | number | null)[]): boolean {
+  if (!row || row.length === 0) return false;
+
+  // 汇总关键词：出现在任意单元格即视为汇总行
+  const summaryKeywords = [
+    "合计", "总计", "共计", "小计", "累计", "汇总",
+    "总调拨数量", "总数量", "总金额",
+  ];
+
+  // 汇总行模式：如 "3 个门店 | 9 种物品 | 总调拨数量：44 件/包"
+  const summaryPatterns = [
+    /\d+\s*个\s*(门店|仓库|站点|店铺)/,
+    /\d+\s*种\s*(物品|商品|SKU)/,
+    /总(调拨|发货|出库|入库)数量[：:]/,
+    /合计[：:]\s*\d+/,
+    /总计[：:]\s*\d+/,
+  ];
+
+  for (let c = 0; c < row.length; c++) {
+    const val = row[c];
+    if (val === null || val === "") continue;
+    const strVal = String(val).trim();
+
+    // 检查关键词
+    for (const kw of summaryKeywords) {
+      if (strVal.includes(kw)) {
+        console.log(`[isSummaryRow] Skipping summary row (keyword "${kw}" in col ${c}): "${strVal.substring(0, 60)}"`);
+        return true;
+      }
+    }
+
+    // 检查正则模式
+    for (const pattern of summaryPatterns) {
+      if (pattern.test(strVal)) {
+        console.log(`[isSummaryRow] Skipping summary row (pattern match in col ${c}): "${strVal.substring(0, 60)}"`);
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 // ----- 尾部信息提取 -----
@@ -183,37 +463,77 @@ function applyFooterExtraction(rule: ParseRule, sheet: RawSheet, orders: ParsedO
   }
 }
 
-// ----- 跨行聚合 -----
+// ----- 跨行聚合（按外部编码分组，SKU 去重合并）-----
 function applyAggregation(rule: ParseRule, orders: ParsedOrder[]): ParsedOrder[] {
   if (!rule.aggregation?.enabled) return orders;
 
-  const groupField = rule.aggregation.groupByField;
+  // 始终按 "外部编码" 分组（这是 targetField，不是 sourceField）
+  const groupField = "外部编码";
   const sharedFields = rule.aggregation.sharedFields;
-  const groups = new Map<string, ParsedOrder[]>();
 
-  // Group by key
+  // Step 1: 按外部编码分组（O(n) Map 查找）
+  const groups = new Map<string, ParsedOrder[]>();
   for (const order of orders) {
-    const key = String((order as any)[groupField] || "");
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(order);
+    const key = String((order as any)[groupField] || "").trim();
+    const groupKey = key || `__ungrouped_${order.rowIndex}`;
+    if (!groups.has(groupKey)) groups.set(groupKey, []);
+    groups.get(groupKey)!.push(order);
   }
 
-  // For each group, fill shared fields from the first item
+  // Step 2: 对每个分组做 SKU 去重合并 + 收货信息共享
   const result: ParsedOrder[] = [];
-  for (const [, group] of groups) {
+  for (const [groupKey, group] of groups) {
     if (group.length === 0) continue;
-    const first = group[0];
-    for (const order of group) {
-      for (const field of sharedFields) {
-        const val = (first as any)[field];
-        if (val && !(order as any)[field]) {
-          (order as any)[field] = val;
+
+    // 收集该组的收货信息（取第一个非空值）
+    const sharedInfo: Record<string, string> = {};
+    for (const field of sharedFields) {
+      for (const order of group) {
+        const val = (order as any)[field];
+        if (val && String(val).trim()) {
+          sharedInfo[field] = String(val).trim();
+          break;
         }
       }
+    }
+
+    // SKU 去重：相同 SKU物品编码 合并（数量求和）
+    const skuMap = new Map<string, ParsedOrder>();
+    for (const order of group) {
+      const skuKey = String(order.SKU物品编码 || "").trim() || `__no_code_${order.rowIndex}`;
+      if (skuMap.has(skuKey)) {
+        // 合并：数量求和
+        const existing = skuMap.get(skuKey)!;
+        existing.SKU发货数量 = (existing.SKU发货数量 || 0) + (order.SKU发货数量 || 0);
+        // 补充缺失的名称/规格
+        if (!existing.SKU物品名称 && order.SKU物品名称) existing.SKU物品名称 = order.SKU物品名称;
+        if (!existing.SKU规格型号 && order.SKU规格型号) existing.SKU规格型号 = order.SKU规格型号;
+        if (!existing.备注 && order.备注) existing.备注 = order.备注;
+      } else {
+        skuMap.set(skuKey, { ...order });
+      }
+    }
+
+    // 填充共享收货信息 + 标记分组
+    let orderIdx = 0;
+    for (const [, order] of skuMap) {
+      for (const field of sharedFields) {
+        if (sharedInfo[field] && !(order as any)[field]) {
+          (order as any)[field] = sharedInfo[field];
+        } else if (sharedInfo[field]) {
+          // 强制统一收货信息（同组共享）
+          (order as any)[field] = sharedInfo[field];
+        }
+      }
+      // 添加分组标记，供 UI 分组展示
+      (order as any)._groupKey = groupKey;
+      (order as any)._groupSize = skuMap.size;
+      (order as any)._groupIndex = orderIdx++;
       result.push(order);
     }
   }
 
+  console.log(`[applyAggregation] ${orders.length} rows → ${result.length} rows in ${groups.size} groups`);
   return result;
 }
 
@@ -321,7 +641,7 @@ function applyCardBoundary(rule: ParseRule, sheet: RawSheet): ParsedOrder[] {
       
       const vals = row.map((v) => (v === null ? "" : String(v).trim()));
       if (vals.every((v) => !v)) continue;
-      if (vals[0] === "合计") continue;
+      if (isSummaryRow(row)) continue;
 
       const order: ParsedOrder = {
         rowIndex: r,
@@ -355,43 +675,42 @@ function applyMultiSheet(rule: ParseRule, rawFile: RawFile): ParsedOrder[] {
     // Apply footer extraction for each sheet
     applyFooterExtraction(rule, sheet, orders);
 
-    // For multi-sheet mode, try to extract store name from sheet
+    // For multi-sheet mode, extract store info from sheet name and footer
     if (rule.multiSheet?.enabled && rule.multiSheet.extractStoreName) {
-      // Store name is in the sheet title (first row)
-      const titleRow = sheet.rows[0];
-      if (titleRow && titleRow[0]) {
-        const title = String(titleRow[0]);
-        // Extract store name from title like "尹三顺自助烤肉（银泰店）出库单"
-        const match = title.match(/^(.+?)出库单/);
-        if (match) {
-          const storeName = match[1].trim();
-          for (const order of orders) {
-            order.收货门店 = storeName;
-          }
-        }
-      }
+      // 门店名优先取 Sheet 名称
+      const storeName = sheet.name.trim();
 
-      // Try to extract contact info from footer rows
-      // Footer typically has: Row 14-15 with 收货门店, 联系人, 联系电话, 收货地址
-      const lastRows = sheet.rows.slice(-5);
-      let 联系人 = "", 联系电话 = "", 收货地址 = "";
+      // 同时尝试从尾部提取联系人信息
+      const lastRows = sheet.rows.slice(-6);
+      let contactName = "", contactPhone = "", contactAddr = "";
+
       for (const lr of lastRows) {
         if (!lr) continue;
         const vals = lr.map((v) => (v === null ? "" : String(v).trim()));
         for (let i = 0; i < vals.length; i++) {
-          if (vals[i].includes("联系人") && i + 1 < vals.length) 联系人 = vals[i + 1];
-          if (vals[i].includes("联系电话") && i + 1 < vals.length) 联系电话 = vals[i + 1];
-          if (vals[i].includes("收货地址") && i + 1 < vals.length) 收货地址 = vals[i + 1];
-          if (vals[i].includes("收货门店") && i + 1 < vals.length) {
-            if (!orders[0]?.收货门店) {
-              for (const o of orders) o.收货门店 = vals[i + 1];
-            }
-          }
+          if (vals[i].includes("联系人") && i + 1 < vals.length) contactName = vals[i + 1];
+          if ((vals[i].includes("联系电话") || vals[i].includes("电话")) && i + 1 < vals.length) contactPhone = vals[i + 1];
+          if (vals[i].includes("收货地址") && i + 1 < vals.length) contactAddr = vals[i + 1];
         }
       }
-      if (联系人) for (const o of orders) o.收件人姓名 = 联系人;
-      if (联系电话) for (const o of orders) o.收件人电话 = 联系电话;
-      if (收货地址) for (const o of orders) o.收件人地址 = 收货地址;
+
+      // 如果尾部没有提取到收货信息，尝试从首行标题提取
+      if (!contactName) {
+        const titleRow = sheet.rows[0];
+        if (titleRow && titleRow[0]) {
+          const title = String(titleRow[0]);
+          const nameMatch = title.match(/收货人[：:]\\s*(\\S+)/);
+          if (nameMatch) contactName = nameMatch[1];
+        }
+      }
+
+      // 将信息填充到该 Sheet 的所有订单
+      for (const order of orders) {
+        order.收货门店 = storeName;
+        if (contactName) order.收件人姓名 = contactName;
+        if (contactPhone) order.收件人电话 = contactPhone;
+        if (contactAddr) order.收件人地址 = contactAddr;
+      }
     }
 
     allOrders.push(...orders);
@@ -594,7 +913,10 @@ function splitPdfOrders(rule: ParseRule, fileText: string, rawFile: RawFile): Pa
     // Parse data rows
     for (let r = tableStart + 1; r < sectionLines.length; r++) {
       const line = sectionLines[r].trim();
-      if (!line || line.includes("合计") || line.includes("总计") || line.includes("签收")) continue;
+      if (!line || line.includes("签收")) continue;
+      // 汇总行检测：扫描整行
+      const summaryTerms = ["合计", "总计", "共计", "小计", "汇总", "总调拨", "总数量"];
+      if (summaryTerms.some(t => line.includes(t))) continue;
 
       const cells = line.split(/\s{2,}|\t/).map((c) => c.trim());
       if (cells.length < 2) continue;

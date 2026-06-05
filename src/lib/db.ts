@@ -11,10 +11,23 @@ function getConnStr(): string {
               process.env.POSTGRES_URL ||
               process.env.POSTGRES_URL_NON_POOLING ||
               "");
-  // 清理 Neon 特有参数，pg 模块不支持
-  conn = conn.replace(/[?&]channel_binding=require/g, "");
-  // 修复清理后可能残留的 ?& 或末尾 ?
-  conn = conn.replace(/\?&/, "?").replace(/\?$/, "");
+  if (!conn) return "";
+
+  // 正确清理 Neon 特有参数 channel_binding=require，保留 ? 或 & 分隔符
+  if (conn.includes("?channel_binding=require&")) {
+    conn = conn.replace(/\?channel_binding=require&/, "?");
+  } else if (conn.includes("?channel_binding=require")) {
+    conn = conn.replace(/\?channel_binding=require/, "");
+  } else if (conn.includes("&channel_binding=require&")) {
+    conn = conn.replace(/&channel_binding=require&/, "&");
+  } else if (conn.includes("&channel_binding=require")) {
+    conn = conn.replace(/&channel_binding=require/, "");
+  }
+
+  // 清理可能残留的 ?& 或末尾的 ? 或 &
+  conn = conn.replace(/\?&/, "?");
+  conn = conn.replace(/[?&]$/, "");
+
   console.log("[DB] Connection string (sanitized):", conn.replace(/\/\/.*@/, "//***@"));
   return conn;
 }
@@ -43,7 +56,7 @@ async function getPgClient() {
     const test = await client.query("SELECT 1 as connected, NOW() as time");
     client.release();
     console.log("[DB] Connected:", JSON.stringify(test.rows?.[0]));
-    
+
     await initTables(pgPool);
     console.log("[DB] Tables ready");
     return createPoolWrapper(pgPool);

@@ -16,6 +16,9 @@ export async function GET(req: NextRequest) {
   const db = await getPgClient();
 
   if (db) {
+    // 确保表存在
+    await ensureOrdersTable(db);
+
     // ---- 数据库模式 ----
     try {
       // Build WHERE conditions
@@ -102,6 +105,9 @@ export async function POST(req: NextRequest) {
   const db = await getPgClient();
 
   if (db) {
+    // 确保表存在
+    await ensureOrdersTable(db);
+
     // ---- 数据库模式：批量插入 ----
     let successCount = 0;
     let failCount = 0;
@@ -173,4 +179,25 @@ function mapDbRowToFrontend(row: any): ParsedOrder {
     _batchId: row.batch_id || undefined,
     _createdAt: row.created_at || undefined,
   };
+}
+
+async function ensureOrdersTable(db: any): Promise<void> {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id SERIAL PRIMARY KEY,
+      batch_id TEXT,
+      external_code TEXT,
+      receive_store TEXT,
+      receiver_name TEXT,
+      receiver_phone TEXT,
+      receiver_address TEXT,
+      sku_code TEXT NOT NULL,
+      sku_name TEXT NOT NULL,
+      sku_quantity INTEGER NOT NULL DEFAULT 0,
+      sku_spec TEXT,
+      remark TEXT,
+      source_file TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
 }

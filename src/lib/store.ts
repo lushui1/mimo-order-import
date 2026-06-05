@@ -8,7 +8,7 @@ const STORAGE_KEYS = {
   ORDERS: "ui_v2_orders",
 } as const;
 
-// ----- 规则管理 -----
+// ----- 规则管理（localStorage 本地缓存）-----
 export function getRules(): ParseRule[] {
   if (typeof window === "undefined") return [];
   try {
@@ -35,6 +35,10 @@ export function saveRule(rule: ParseRule): { success: boolean; error?: string } 
     rules.push(rule);
   }
   localStorage.setItem(STORAGE_KEYS.RULES, JSON.stringify(rules));
+  
+  // 同时同步到服务端
+  syncRuleToServer(rule);
+  
   return { success: true };
 }
 
@@ -46,13 +50,57 @@ export function checkRuleNameDuplicate(name: string, excludeId?: string): boolea
 export function deleteRule(id: string): void {
   const rules = getRules().filter((r) => r.id !== id);
   localStorage.setItem(STORAGE_KEYS.RULES, JSON.stringify(rules));
+  deleteRuleFromServer(id);
 }
 
 export function getRule(id: string): ParseRule | undefined {
   return getRules().find((r) => r.id === id);
 }
 
-// ----- 运单管理 -----
+// ----- 规则服务端同步 -----
+async function syncRuleToServer(rule: ParseRule): Promise<void> {
+  try {
+    await fetch("/api/rules", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(rule),
+    });
+  } catch (e) {
+    console.warn("[store] Failed to sync rule to server:", e);
+  }
+}
+
+async function deleteRuleFromServer(id: string): Promise<void> {
+  try {
+    await fetch(`/api/rules?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+  } catch (e) {
+    console.warn("[store] Failed to delete rule from server:", e);
+  }
+}
+
+export async function syncRulesFromServer(rules: ParseRule[]): Promise<ParseRule[]> {
+  try {
+    const res = await fetch("/api/rules");
+    if (res.ok) {
+      const data = await res.json();
+      if (data.rules && data.rules.length > 0) {
+        // Merge: server rules take priority, deduplicate by id
+        const serverIds = new Set(data.rules.map((r: ParseRule) => r.id));
+        const merged = [...data.rules, ...rules.filter(r => !serverIds.has(r.id))];
+        localStorage.setItem(STORAGE_KEYS.RULES, JSON.stringify(merged));
+        return merged;
+      }
+    }
+  } catch (e) {
+    console.warn("[store] Failed to sync rules from server:", e);
+  }
+  return rules;
+}
+
+// ===== 运单管理 -----
+// 当前解析结果的临时存储（页面跳转用）
+const CURRENT_KEY = "ui_v2_current_orders";
+
 export function getOrders(): ParsedOrder[] {
   if (typeof window === "undefined") return [];
   try {
@@ -71,13 +119,15 @@ export function saveOrders(orders: ParsedOrder[]): { success: boolean; count: nu
 }
 
 export function clearCurrentOrders(): void {
-  localStorage.removeItem("ui_v2_current_orders");
+  if (typeof window !== "undefined") {
+    localStorage.removeItem(CURRENT_KEY);
+  }
 }
 
 export function getCurrentOrders(): ParsedOrder[] {
   if (typeof window === "undefined") return [];
   try {
-    const data = localStorage.getItem("ui_v2_current_orders");
+    const data = localStorage.getItem(CURRENT_KEY);
     return data ? JSON.parse(data) : [];
   } catch {
     return [];
@@ -85,7 +135,9 @@ export function getCurrentOrders(): ParsedOrder[] {
 }
 
 export function setCurrentOrders(orders: ParsedOrder[]): void {
-  localStorage.setItem("ui_v2_current_orders", JSON.stringify(orders));
+  if (typeof window !== "undefined") {
+    localStorage.setItem(CURRENT_KEY, JSON.stringify(orders));
+  }
 }
 
 // ----- ID 生成 -----
